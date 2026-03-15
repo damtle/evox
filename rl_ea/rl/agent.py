@@ -34,6 +34,7 @@ class TD3Agent:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.cfg.critic_lr)
 
         self.total_updates = 0
+        self.last_actor_loss = 0.0  # 【新增】
 
     def act(self, state: torch.Tensor, noise_std: float = 0.0) -> torch.Tensor:
         self.actor.eval()
@@ -84,7 +85,11 @@ class TD3Agent:
 
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
-            info['actor_loss'] = float(actor_loss.item())
+            # info['actor_loss'] = float(actor_loss.item())
+
+            self.last_actor_loss = float(actor_loss.item())  # 【新增】记录最新 loss
+
+        info['actor_loss'] = self.last_actor_loss  # 【新增】保证每次字典里都有这行
 
         return info
 

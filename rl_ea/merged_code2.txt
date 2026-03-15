@@ -1,0 +1,920 @@
+### 1. 目录框架 (Directory Structure)
+--------------------------------------
+rl_ea/
+    __init__.py
+    run_example.py
+    test.py
+    merge2onefile.py
+    features/
+        __init__.py
+        state_builder.py
+    rl/
+        __init__.py
+        agent.py
+        networks.py
+    replay/
+        __init__.py
+        buffer.py
+    utils/
+        __init__.py
+        optimization.py
+    algorithms/
+        pso_rl.py
+        __init__.py
+        rl_wrapper.py
+
+
+### 2. 代码详情 (Code Details)
+======================================
+
+// File: __init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: run_example.py
+----------------------------------------
+"""Minimal example for using the RL-enhanced PSO in EvoX.
+
+This script assumes you already have EvoX installed and available in the environment.
+It uses a simple Sphere problem through an EvoX-compatible workflow. If your local
+workflow API differs slightly, keep the algorithm construction unchanged and adapt
+only the workflow section.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from rl_ea.algorithms.pso_rl import make_rl_pso
+
+
+class SphereProblem:
+    def evaluate(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sum(x * x, dim=1)
+
+
+class SimpleWorkflow:
+    """A lightweight stand-in workflow showing how EvoX injects evaluate into the algorithm.
+
+    If you already use EvoX workflows, you likely won't need this class. It is provided so the
+    example is runnable even without remembering the exact high-level workflow API.
+    """
+
+    def __init__(self, algorithm, problem):
+        self.algorithm = algorithm
+        self.problem = problem
+        # In EvoX, Algorithm.evaluate is normally proxied by workflow.
+        self.algorithm.evaluate = self.problem.evaluate
+
+    def init_step(self):
+        self.algorithm.init_step()
+
+    def step(self):
+        self.algorithm.step()
+
+
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dim = 10
+    pop_size = 64
+    lb = -5.0 * torch.ones(dim, device=device)
+    ub = 5.0 * torch.ones(dim, device=device)
+
+    algo = make_rl_pso(pop_size=pop_size, lb=lb, ub=ub, device=device)
+    problem = SphereProblem()
+    workflow = SimpleWorkflow(algo, problem)
+
+    workflow.init_step()
+    for gen in range(200):
+        workflow.step()
+        best = float(algo.base.global_best_fit.item())
+        if gen % 10 == 0:
+            print(f'gen={gen:04d}, best={best:.6f}')
+
+
+==================================================
+
+// File: test.py
+----------------------------------------
+import torch
+from evox.algorithms import PSO
+from evox.problems.numerical import Ackley
+from evox.workflows import StdWorkflow, EvalMonitor
+
+# torch.set_default_device("cuda") # Uncomment this line if you want to use GPU by default
+
+algorithm = PSO(pop_size=100, lb=-32 * torch.ones(10), ub=32 * torch.ones(10))
+problem = Ackley()
+monitor = EvalMonitor()
+workflow = StdWorkflow(algorithm, problem, monitor)
+workflow.init_step()
+for i in range(100):
+    workflow.step()
+
+monitor.plot() # or monitor.plot().show() if you are using headless mode
+
+==================================================
+
+// File: merge2onefile.py
+----------------------------------------
+import os
+
+
+def generate_directory_tree(startpath):
+    """生成目录树结构的字符串"""
+    tree_str = "### 1. 目录框架 (Directory Structure)\n"
+    tree_str += "--------------------------------------\n"
+    for root, dirs, files in os.walk(startpath):
+        # 排除脚本自身和隐藏文件夹
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+        level = root.replace(startpath, '').count(os.sep)
+        indent = ' ' * 4 * level
+        tree_str += f"{indent}{os.path.basename(root)}/\n"
+        sub_indent = ' ' * 4 * (level + 1)
+        for f in files:
+            if f.endswith('.py') and f != 'merge_py.py':
+                tree_str += f"{sub_indent}{f}\n"
+    return tree_str
+
+
+def merge_python_files(output_file="merged_code2.txt"):
+    current_dir = os.getcwd()
+
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        # 第一步：写入目录树
+        outfile.write(generate_directory_tree(current_dir))
+        outfile.write("\n\n### 2. 代码详情 (Code Details)\n")
+        outfile.write("======================================\n\n")
+
+        # 第二步：递归遍历并写入代码
+        for root, _, files in os.walk(current_dir):
+            for file in files:
+                if file.endswith('.py') and file != 'merge_py.py':
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, current_dir)
+
+                    outfile.write(f"// File: {relative_path}\n")
+                    outfile.write("-" * 40 + "\n")
+
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            outfile.write(infile.read())
+                    except Exception as e:
+                        outfile.write(f"Error reading file: {e}\n")
+
+                    outfile.write("\n\n" + "=" * 50 + "\n\n")
+
+    print(f"成功！所有 .py 文件已合并至: {output_file}")
+
+
+if __name__ == "__main__":
+    merge_python_files()
+
+==================================================
+
+// File: features/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: features/state_builder.py
+----------------------------------------
+import torch
+
+
+class StateBuilder:
+    """Build per-individual state features for black-box optimization.
+
+    State format for each individual i:
+        s_i = [x_i, Δx_i, f_i, Δf_i]
+    where Δx_i = x_i - x_i_prev and Δf_i = f_i - f_i_prev.
+
+    For the first available state, callers should supply prev_x=x and prev_f=f so that
+    the delta terms are zero.
+    """
+
+    def build(self, x: torch.Tensor, prev_x: torch.Tensor, f: torch.Tensor, prev_f: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"Expected x to have shape [pop, dim], got {tuple(x.shape)}")
+        if prev_x.shape != x.shape:
+            raise ValueError("prev_x must have the same shape as x")
+        if f.ndim != 1 or prev_f.ndim != 1:
+            raise ValueError("f and prev_f must be 1D tensors")
+
+        dx = x - prev_x
+        df = f - prev_f
+
+        # 【关键修复】：对适应度特征进行 Symlog (Symmetric Log) 平滑处理，把 10^10 压到 20 左右的范围
+        f_norm = torch.sign(f) * torch.log1p(torch.abs(f))
+        df_norm = torch.sign(df) * torch.log1p(torch.abs(df))
+
+        # 将 x 和 dx 除以 100 进行简单的尺度缩放 (CEC2022 范围通常是 -100 到 100)
+        return torch.cat([x / 100.0, dx / 100.0, f_norm[:, None], df_norm[:, None]], dim=1)
+
+
+==================================================
+
+// File: rl/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: rl/agent.py
+----------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass
+import copy
+import torch
+import torch.nn.functional as F
+from .networks import Actor, Critic
+
+
+@dataclass
+class TD3Config:
+    gamma: float = 0.99
+    tau: float = 0.005
+    policy_noise: float = 0.2
+    noise_clip: float = 0.5
+    policy_freq: int = 2
+    actor_lr: float = 1e-3
+    critic_lr: float = 1e-3
+    hidden_dim: int = 256
+
+
+class TD3Agent:
+    def __init__(self, state_dim: int, action_dim: int, max_action: torch.Tensor, device: torch.device, cfg: TD3Config | None = None):
+        self.cfg = cfg or TD3Config()
+        self.device = device
+        self.max_action = max_action.to(device)
+
+        self.actor = Actor(state_dim, action_dim, self.cfg.hidden_dim, self.max_action).to(device)
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=self.cfg.actor_lr)
+
+        self.critic = Critic(state_dim, action_dim, self.cfg.hidden_dim).to(device)
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.cfg.critic_lr)
+
+        self.total_updates = 0
+        self.last_actor_loss = 0.0  # 【新增】
+
+    def act(self, state: torch.Tensor, noise_std: float = 0.0) -> torch.Tensor:
+        self.actor.eval()
+        with torch.no_grad():
+            action = self.actor(state.to(self.device))
+            if noise_std > 0:
+                action = action + noise_std * self.max_action * torch.randn_like(action)
+            action = torch.max(torch.min(action, self.max_action), -self.max_action)
+        self.actor.train()
+        return action
+
+    def update(self, batch: dict) -> dict:
+        s = batch['states']
+        a = batch['actions']
+        r = batch['rewards'].unsqueeze(-1)
+        s2 = batch['next_states']
+        d = batch['dones'].unsqueeze(-1)
+
+        with torch.no_grad():
+            noise = (torch.randn_like(a) * self.cfg.policy_noise * self.max_action).clamp(
+                -self.cfg.noise_clip * self.max_action,
+                self.cfg.noise_clip * self.max_action,
+            )
+            next_a = self.actor_target(s2) + noise
+            next_a = torch.max(torch.min(next_a, self.max_action), -self.max_action)
+            target_q1, target_q2 = self.critic_target(s2, next_a)
+            target_q = torch.min(target_q1, target_q2)
+            y = r + (1.0 - d) * self.cfg.gamma * target_q
+
+        q1, q2 = self.critic(s, a)
+        critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
+
+        td_error = (q1.detach() - y).abs().squeeze(-1)
+        info = {
+            'critic_loss': float(critic_loss.item()),
+            'td_error': td_error,
+        }
+
+        self.total_updates += 1
+        if self.total_updates % self.cfg.policy_freq == 0:
+            actor_loss = -self.critic.q1_only(s, self.actor(s)).mean()
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            self._soft_update(self.actor, self.actor_target)
+            self._soft_update(self.critic, self.critic_target)
+            # info['actor_loss'] = float(actor_loss.item())
+
+            self.last_actor_loss = float(actor_loss.item())  # 【新增】记录最新 loss
+
+        info['actor_loss'] = self.last_actor_loss  # 【新增】保证每次字典里都有这行
+
+        return info
+
+    def _soft_update(self, net, target_net):
+        tau = self.cfg.tau
+        for p, tp in zip(net.parameters(), target_net.parameters()):
+            tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+
+
+==================================================
+
+// File: rl/networks.py
+----------------------------------------
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class MLP(nn.Module):
+    def __init__(self, dims, activation=nn.ReLU, out_activation=None):
+        super().__init__()
+        layers = []
+        for i in range(len(dims) - 2):
+            layers += [nn.Linear(dims[i], dims[i + 1]), activation()]
+        layers += [nn.Linear(dims[-2], dims[-1])]
+        if out_activation is not None:
+            layers += [out_activation()]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, max_action: torch.Tensor | float = 1.0):
+        super().__init__()
+        self.net = MLP([state_dim, hidden_dim, hidden_dim, action_dim])
+        if isinstance(max_action, (float, int)):
+            max_action = torch.tensor(float(max_action))
+        self.register_buffer('max_action', max_action)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        action = torch.tanh(self.net(state))
+        return action * self.max_action
+
+
+class Critic(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.q1 = MLP([state_dim + action_dim, hidden_dim, hidden_dim, 1])
+        self.q2 = MLP([state_dim + action_dim, hidden_dim, hidden_dim, 1])
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor):
+        sa = torch.cat([state, action], dim=-1)
+        return self.q1(sa), self.q2(sa)
+
+    def q1_only(self, state: torch.Tensor, action: torch.Tensor):
+        sa = torch.cat([state, action], dim=-1)
+        return self.q1(sa)
+
+
+==================================================
+
+// File: replay/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: replay/buffer.py
+----------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence
+import numpy as np
+import torch
+
+
+@dataclass
+class Transition:
+    state: torch.Tensor
+    action: torch.Tensor
+    reward: torch.Tensor
+    next_state: torch.Tensor
+    done: torch.Tensor
+    future_improvement: torch.Tensor
+    td_priority: float
+    source: int  # 0 = EA, 1 = RL
+    traj_id: int
+    step_id: int
+
+
+class PrioritizedReplayBuffer:
+    """Replay buffer specialized for optimization traces.
+
+    Priorities combine TD-style priority and future-improvement signal:
+        p_i ∝ alpha * td_priority + beta * future_improvement
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.capacity = int(capacity)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.device = device if device is not None else torch.device('cpu')
+        self.data: List[Transition] = []
+        self.pos = 0
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def add(self, transition: Transition) -> None:
+        if len(self.data) < self.capacity:
+            self.data.append(transition)
+        else:
+            self.data[self.pos] = transition
+            self.pos = (self.pos + 1) % self.capacity
+
+    def _priority_array(self) -> np.ndarray:
+        if not self.data:
+            return np.array([], dtype=np.float64)
+        priorities = []
+        for t in self.data:
+            td_term = max(float(t.td_priority), 1e-6)
+            future_term = max(float(t.future_improvement.item()), 0.0)
+            p = self.alpha * td_term + self.beta * future_term + 1e-6
+            priorities.append(p)
+        arr = np.asarray(priorities, dtype=np.float64)
+        arr /= arr.sum()
+        return arr
+
+    def sample(self, batch_size: int, rl_ratio: Optional[float] = None) -> Dict[str, torch.Tensor]:
+        if len(self.data) < batch_size:
+            raise ValueError(f"Not enough data in replay buffer: {len(self.data)} < {batch_size}")
+
+        if rl_ratio is None:
+            indices = np.random.choice(len(self.data), size=batch_size, replace=False, p=self._priority_array())
+        else:
+            rl_ratio = float(rl_ratio)
+            rl_idx = [i for i, t in enumerate(self.data) if t.source == 1]
+            ea_idx = [i for i, t in enumerate(self.data) if t.source == 0]
+            n_rl = min(len(rl_idx), max(0, int(round(batch_size * rl_ratio))))
+            n_ea = batch_size - n_rl
+            if len(ea_idx) < n_ea:
+                n_ea = len(ea_idx)
+                n_rl = batch_size - n_ea
+            if len(rl_idx) < n_rl:
+                n_rl = len(rl_idx)
+                n_ea = batch_size - n_rl
+            p = self._priority_array()
+            chosen = []
+            if n_rl > 0:
+                p_rl = p[rl_idx]
+                p_rl = p_rl / p_rl.sum()
+                chosen.extend(np.random.choice(rl_idx, size=n_rl, replace=False, p=p_rl).tolist())
+            if n_ea > 0:
+                p_ea = p[ea_idx]
+                p_ea = p_ea / p_ea.sum()
+                chosen.extend(np.random.choice(ea_idx, size=n_ea, replace=False, p=p_ea).tolist())
+            indices = np.asarray(chosen, dtype=np.int64)
+            np.random.shuffle(indices)
+
+        batch = [self.data[i] for i in indices]
+        return {
+            'states': torch.stack([t.state for t in batch]).to(self.device),
+            'actions': torch.stack([t.action for t in batch]).to(self.device),
+            'rewards': torch.stack([t.reward for t in batch]).to(self.device),
+            'next_states': torch.stack([t.next_state for t in batch]).to(self.device),
+            'dones': torch.stack([t.done for t in batch]).to(self.device),
+            'future_improvements': torch.stack([t.future_improvement for t in batch]).to(self.device),
+            'indices': torch.as_tensor(indices, device=self.device, dtype=torch.long),
+        }
+
+    def update_td_priorities(self, indices: Sequence[int], td_errors: torch.Tensor) -> None:
+        td = td_errors.detach().abs().flatten().cpu().numpy()
+        for i, err in zip(indices, td):
+            if 0 <= int(i) < len(self.data):
+                t = self.data[int(i)]
+                t.td_priority = float(err) + 1e-6
+
+
+==================================================
+
+// File: utils/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: utils/optimization.py
+----------------------------------------
+from __future__ import annotations
+
+import torch
+
+
+def relative_improvement_reward(curr_fit: torch.Tensor, next_fit: torch.Tensor, global_best: torch.Tensor,
+                                eps: float = 1e-8, best_bonus: float = 0.1) -> torch.Tensor:
+    """Relative-improvement reward for minimization."""
+    reward = (curr_fit - next_fit) / (curr_fit.abs() + eps)
+
+    # 【关键修复】：限制单步奖励的范围，防止极端负奖励摧毁 Critic 网络
+    reward = torch.clamp(reward, min=-1.0, max=1.0)
+
+    reward = reward.clone()
+    improved = next_fit < global_best
+    reward[improved] += best_bonus
+    return reward
+
+
+def compute_future_improvement(fits: torch.Tensor) -> torch.Tensor:
+    """For a trajectory fitness sequence [f0, ..., fT], return future improvements
+    fi - min_{k>=i} fk for each i.
+    """
+    best_suffix = torch.minimum(torch.flip(torch.cummin(torch.flip(fits, dims=[0]), dim=0).values, dims=[0]), fits)
+    return fits - best_suffix
+
+
+==================================================
+
+// File: algorithms/pso_rl.py
+----------------------------------------
+from __future__ import annotations
+
+import torch
+from evox.algorithms import PSO, SaDE
+
+from rl_ea.rl.agent import TD3Agent, TD3Config
+from rl_ea.replay.buffer import PrioritizedReplayBuffer
+from rl_ea.algorithms.rl_wrapper import RLEnhancedAlgorithm
+
+
+def make_rl_pso(
+    pop_size: int,
+    lb: torch.Tensor,
+    ub: torch.Tensor,
+    device: torch.device | None = None,
+    w: float = 0.6,
+    phi_p: float = 2.5,
+    phi_g: float = 0.8,
+    replay_capacity: int = 200000,
+    rl_candidate_ratio: float = 0.05,
+    train_after: int = 512,
+    train_steps_per_gen: int = 5,
+    batch_size: int = 256,
+    exploration_noise: float = 0.05,
+    enable_rl: bool = True,
+    warmup_gens: int = 50
+):
+    device = torch.get_default_device() if device is None else device
+    # base = PSO(pop_size=pop_size, lb=lb, ub=ub, w=w, phi_p=phi_p, phi_g=phi_g, device=device)
+    base = SaDE(pop_size, lb, ub, device=device)
+    if not enable_rl:
+        return base
+
+    dim = lb.shape[0]
+    state_dim = 2 * dim + 2
+    action_dim = dim
+    max_action = (ub - lb).to(device) * 0.01
+    agent = TD3Agent(state_dim, action_dim, max_action=max_action, device=device, cfg=TD3Config())
+    replay = PrioritizedReplayBuffer(capacity=replay_capacity, device=device)
+    algo = RLEnhancedAlgorithm(
+        base_algo=base,
+        rl_agent=agent,
+        replay_buffer=replay,
+        rl_candidate_ratio=rl_candidate_ratio,
+        train_after=train_after,
+        train_steps_per_gen=train_steps_per_gen,
+        batch_size=batch_size,
+        action_scale=max_action,
+        exploration_noise=exploration_noise,
+        device=device,
+        warmup_gens=warmup_gens,
+    )
+    return algo
+
+
+==================================================
+
+// File: algorithms/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// File: algorithms/rl_wrapper.py
+----------------------------------------
+from __future__ import annotations
+
+from typing import Optional
+import torch
+from evox.core import Algorithm, Mutable
+from evox.utils import clamp
+
+from rl_ea.features.state_builder import StateBuilder
+from rl_ea.replay.buffer import PrioritizedReplayBuffer, Transition
+from rl_ea.utils.optimization import relative_improvement_reward, compute_future_improvement
+
+
+class RLEnhancedAlgorithm(Algorithm):
+    """Generic wrapper that augments any EvoX algorithm with RL-generated candidates.
+
+    Requirements on base algorithm:
+    - has attributes: pop, fit, lb, ub
+    - supports init_step() and step()
+    - self.evaluate(...) available through EvoX workflow
+    """
+
+    def __init__(
+        self,
+        base_algo: Algorithm,
+        rl_agent,
+        replay_buffer: PrioritizedReplayBuffer,
+        rl_candidate_ratio: float = 0.3,
+        train_after: int = 512,
+        train_steps_per_gen: int = 1,
+        batch_size: int = 256,
+        action_scale: Optional[torch.Tensor] = None,
+        exploration_noise: float = 0.1,
+        device: Optional[torch.device] = None,
+        warmup_gens: int = 50,
+    ) -> None:
+        super().__init__()
+        self.base = base_algo
+        self.rl_agent = rl_agent
+        self.replay = replay_buffer
+        self.state_builder = StateBuilder()
+        self.rl_candidate_ratio = float(rl_candidate_ratio)
+        self.train_after = int(train_after)
+        self.train_steps_per_gen = int(train_steps_per_gen)
+        self.batch_size = int(batch_size)
+        self.exploration_noise = float(exploration_noise)
+        self.device = device if device is not None else base_algo.fit.device
+        self.warmup_gens = int(warmup_gens)
+
+        pop_shape = base_algo.pop.shape
+        self.pop_size, self.dim = pop_shape[0], pop_shape[1]
+        if action_scale is None:
+            action_scale = (base_algo.ub - base_algo.lb).squeeze(0) * 0.1
+        self.action_scale = action_scale.to(self.device)
+
+        # history required to form state features
+        self.prev_pop = Mutable(base_algo.pop.clone())
+        self.prev_fit = Mutable(torch.full_like(base_algo.fit, torch.inf))
+        self.traj_counter = Mutable(torch.tensor(0, device=self.device))
+        self.step_counter = Mutable(torch.tensor(0, device=self.device))
+
+        # 【新增】：用于日志统计的计数器
+        self.log_rl_success = 0  # RL 生成更好解的次数
+        self.log_rl_total = 0  # RL 生成解的总次数
+        self.log_rl_improve = 0.0  # RL 带来的适应度总提升量
+
+        # 【核心修复 1】：Wrapper 独立维护全局最优，彻底与底层算法解耦
+        self.global_best_fit = Mutable(torch.tensor(torch.inf, device=self.device))
+        self.global_best_location = Mutable(torch.zeros(self.dim, device=self.device))
+
+    # expose population and fitness for workflow compatibility
+    @property
+    def pop(self):
+        return self.base.pop
+
+    @pop.setter
+    def pop(self, value):
+        self.base.pop = value
+
+    @property
+    def fit(self):
+        return self.base.fit
+
+    @fit.setter
+    def fit(self, value):
+        self.base.fit = value
+
+    @property
+    def lb(self):
+        return self.base.lb
+
+    @property
+    def ub(self):
+        return self.base.ub
+
+    def init_step(self):
+        if hasattr(self, 'evaluate'):
+            self.base.evaluate = self.evaluate
+
+        self.base.init_step()
+        self.prev_pop = self.base.pop.clone()
+        self.prev_fit = self.base.fit.clone()
+
+        # 【核心修复 2】：初始化时，从种群中找出当前的最优值存入 Wrapper
+        best_val, best_idx = torch.min(self.base.fit, dim=0)
+        self.global_best_fit = best_val.clone()
+        self.global_best_location = self.base.pop[best_idx].clone()
+
+    def step(self):
+        # 1) Let the base EA advance first.
+        self.base.step()
+        pop = self.base.pop
+        fit = self.base.fit
+
+        # 2) Build current state from real EA trace.
+        prev_fit = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
+        states = self.state_builder.build(pop, self.prev_pop, fit, prev_fit)
+
+        current_step = int(self.step_counter.item())
+        is_warmup_over = current_step >= self.warmup_gens
+
+        n_rl = max(1, int(round(self.pop_size * self.rl_candidate_ratio)))
+        traj_id = int(self.traj_counter.item())
+        step_id = current_step
+
+        num_success = 0
+        improvement_sum = 0.0
+
+        # =========================================================================
+        # 3~5) RL 动作、评估与选择 (★ 仅在预热结束后执行，彻底节省评估算力 FEs)
+        # =========================================================================
+        if is_warmup_over:
+            n_rl = max(1, int(round(self.pop_size * self.rl_candidate_ratio)))
+            rl_indices = torch.randperm(self.pop_size, device=self.device)[:n_rl]
+            rl_states = states[rl_indices]
+
+            # 获取 RL 网络输出的动作 (范围被限制在 [-action_scale, action_scale])
+            raw_action = self.rl_agent.act(rl_states, noise_std=self.exploration_noise)
+
+            # 【关键修复】：将动作还原为 [-1, 1] 的相对比例
+            normalized_action = raw_action / self.action_scale
+
+            # 计算当前种群在各个维度上的标准差，作为 "收敛程度感知器"
+            pop_std = torch.std(self.base.pop, dim=0)
+
+            # 加上一个极小的 epsilon 防止后期完全变成 0，导致停滞
+            dynamic_step_size = pop_std + 1e-6
+
+            # 实际执行的动作 = 相对方向 * 种群标准差 * 探索系数(比如让它在 1.5 倍标准差内探索)
+            actual_scaled_action = normalized_action * dynamic_step_size * 1.5
+
+            # 叠加到原位置上
+            candidate_pop = pop[rl_indices] + actual_scaled_action
+            candidate_pop = clamp(candidate_pop, self.lb, self.ub)
+            candidate_fit = self.evaluate(candidate_pop)
+
+            # 4) Store RL-generated transitions with true evaluations.
+            next_states = self.state_builder.build(candidate_pop, pop[rl_indices], candidate_fit, fit[rl_indices])
+            # 【核心修复 3】：使用 Wrapper 自己的 global_best_fit 计算奖励
+            reward = relative_improvement_reward(fit[rl_indices], candidate_fit,
+                                                 self.global_best_fit.expand_as(candidate_fit))
+            done = torch.zeros_like(reward)
+            # future-improvement placeholder; updated from immediate improvement for online usage
+            future_improvement = torch.clamp(fit[rl_indices] - candidate_fit, min=0.0)
+
+            traj_id = int(self.traj_counter.item())
+            step_id = int(self.step_counter.item())
+            for i in range(n_rl):
+                t = Transition(
+                    state=rl_states[i].detach().cpu(),
+                    action=raw_action[i].detach().cpu(),
+                    reward=reward[i].detach().cpu(),
+                    next_state=next_states[i].detach().cpu(),
+                    done=done[i].detach().cpu(),
+                    future_improvement=future_improvement[i].detach().cpu(),
+                    td_priority=float(abs(reward[i].item()) + 1e-6),
+                    source=1,
+                    traj_id=traj_id,
+                    step_id=step_id,
+                )
+                self.replay.add(t)
+
+            # =========================================================================
+            # 5) Selection: 1-to-1 Niche Replacement (通用生态位原位替换)
+            # 核心思想: 无论是 PSO 还是 DE，RL 只在个体的当前位置提供“局部梯度下降”
+            # 绝不跨越生态位替换其他粒子，从而最大程度保护 EA 的种群多样性和探索能力
+            # =========================================================================
+            better = candidate_fit < fit[rl_indices]
+
+            num_success = better.sum().item()
+            improvement_sum = 0.0
+
+            if better.any():
+                improvement_sum = (fit[rl_indices][better] - candidate_fit[better]).sum().item()
+
+                # 获取获得了适应度提升的个体原始索引
+                selected_idx = rl_indices[better]
+
+                # 1. 物理位置与适应度的原位替换 (Universal)
+                pop[selected_idx] = candidate_pop[better]
+                fit[selected_idx] = candidate_fit[better]
+
+                # 2. 动态状态重置 (向下兼容 PSO 等含有复杂物理动量的算法)
+                # 如果是 SaDE，因为没有 velocity 属性，会自动安全跳过
+                if hasattr(self.base, 'velocity'):
+                    self.base.velocity[selected_idx] = torch.zeros_like(self.base.velocity[selected_idx])
+
+                # 如果是 PSO，需要同步更新个体的历史最优记录
+                if hasattr(self.base, 'local_best_fit'):
+                    compare = self.base.local_best_fit[selected_idx] > candidate_fit[better]
+                    lidx = selected_idx[compare]
+                    if lidx.numel() > 0:
+                        self.base.local_best_location[lidx] = candidate_pop[better][compare].clone()
+                        self.base.local_best_fit[lidx] = candidate_fit[better][compare]
+
+            # 记录日志统计
+            self.log_rl_success += num_success
+            self.log_rl_total += n_rl
+            self.log_rl_improve += improvement_sum
+
+        # 同步回底层 Algorithm
+        self.base.pop = pop
+        self.base.fit = fit
+
+        # =========================================================================
+        # 3. 更新全局最优 (Global Best) - 同样采用向下兼容设计
+        # =========================================================================
+        current_best_val, current_best_idx = torch.min(self.base.fit, dim=0)
+        if current_best_val < self.global_best_fit:
+            self.global_best_fit = current_best_val.clone()
+            self.global_best_location = self.base.pop[current_best_idx].clone()
+
+        # 将 Wrapper 维护的全局最优，反向同步给需要的底层 EA
+        if hasattr(self.base, 'global_best_fit'):  # 兼容 PSO
+            self.base.global_best_fit = self.global_best_fit.clone()
+            self.base.global_best_location = self.global_best_location.clone()
+        if hasattr(self.base, 'best_index'):  # 兼容 SaDE
+            self.base.best_index = current_best_idx
+
+        # =========================================================================
+        # 6) Store EA transitions (保持不变)
+        # =========================================================================
+        ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
+        ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
+        ea_next_states = states
+        prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit, prev_fit)
+
+        pop_std = torch.std(self.base.pop, dim=0)
+        dynamic_step_size = pop_std + 1e-6
+
+        for i in range(min(self.pop_size, n_rl)):
+            idx = int(i)
+            dx = pop[idx] - self.prev_pop[idx]
+            ea_raw_action = (dx / (dynamic_step_size * 1.5)) * self.action_scale
+            ea_raw_action = torch.clamp(ea_raw_action, -self.action_scale, self.action_scale)
+
+            t = Transition(
+                state=prev_states[idx].detach().cpu(),
+                action=ea_raw_action.detach().cpu(),
+                reward=ea_reward[idx].detach().cpu(),
+                next_state=ea_next_states[idx].detach().cpu(),
+                done=torch.tensor(0.0, device='cpu'),
+                future_improvement=ea_future[idx].detach().cpu(),
+                td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
+                source=0,
+                traj_id=traj_id,
+                step_id=step_id,
+            )
+            self.replay.add(t)
+
+        # =========================================================================
+        # 7) Train RL from replay
+        # =========================================================================
+        info = {}
+        if len(self.replay) >= self.train_after and is_warmup_over:
+            for _ in range(self.train_steps_per_gen):
+                batch = self.replay.sample(self.batch_size, rl_ratio=0.5)
+                info = self.rl_agent.update(batch)
+                self.replay.update_td_priorities(batch['indices'].tolist(), info['td_error'])
+
+        # =========================================================================
+        # 8) Logging with Population Diversity Monitor
+        # =========================================================================
+        current_step = int(self.step_counter.item())
+        if current_step > 0 and current_step % 50 == 0:
+            success_rate = self.log_rl_success / max(1, self.log_rl_total)
+            avg_imp = self.log_rl_improve / max(1, self.log_rl_success)
+
+            # 【重要指标】：计算种群平均标准差，监控多样性
+            diversity = pop_std.mean().item()
+
+            print(
+                f"   [RL Log Gen {current_step}] 成功率: {success_rate:.2%} ({self.log_rl_success}/{self.log_rl_total}) | 平均提升: {avg_imp:.2e} | 种群多样性: {diversity:.4e}")
+            if 'critic_loss' in info:
+                print(
+                    f"                  Critic Loss: {info.get('critic_loss', 0):.4f} | Actor Loss: {info.get('actor_loss', 0):.4f}")
+
+            self.log_rl_success = 0
+            self.log_rl_total = 0
+            self.log_rl_improve = 0.0
+
+        self.prev_pop = self.base.pop.clone()
+        self.prev_fit = self.base.fit.clone()
+        self.step_counter = self.step_counter + 1
+
+
+==================================================
+

@@ -18,7 +18,7 @@ def generate_directory_tree(startpath):
     return tree_str
 
 
-def merge_python_files(output_file="merged_code.txt"):
+def merge_python_files(output_file="merged_code2.txt"):
     current_dir = os.getcwd()
 
     with open(output_file, 'w', encoding='utf-8') as outfile:
