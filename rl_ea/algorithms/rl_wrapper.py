@@ -69,6 +69,8 @@ class RLEnhancedAlgorithm(Algorithm):
 
 
         self.ema_success_rate = 1.0  # 初始保持乐观，设为 100%
+        # 【新增】：追踪每个粒子的停滞代数
+        self.stagnation = Mutable(torch.zeros(self.pop_size, device=self.device))
     # expose population and fitness for workflow compatibility
     @property
     def pop(self):
@@ -108,73 +110,110 @@ class RLEnhancedAlgorithm(Algorithm):
         self.global_best_location = self.base.pop[best_idx].clone()
 
     def step(self):
-        # 1) Let the base EA advance first.
         self.base.step()
         pop = self.base.pop
         fit = self.base.fit
 
-        # 2) Build current state from real EA trace.
-        prev_fit = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
-        states = self.state_builder.build(pop, self.prev_pop, fit, prev_fit)
+        # 【新增】：更新个体的停滞代数
+        improved = fit < self.prev_fit
+        self.stagnation = torch.where(improved, torch.zeros_like(self.stagnation), self.stagnation + 1)
 
-        # 计算当前种群在各个维度上的标准差，作为 "收敛程度感知器"
-        pop_std = torch.std(self.base.pop, dim=0)
+        pop_mean = torch.mean(pop, dim=0)
+        pop_std = torch.std(pop, dim=0)
         diversity = pop_std.mean().item()
+
+        # Build state (传入新增的 pop_mean, pop_std, stagnation)
+        prev_fit_safe = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
+        states = self.state_builder.build(pop, self.prev_pop, fit, prev_fit_safe, pop_mean, pop_std, self.stagnation)
 
         current_step = int(self.step_counter.item())
         is_warmup_over = current_step >= self.warmup_gens
+        # =========================================================================
+        # 【修复问题 7】：极其严谨的分段智能门控逻辑
+        # =========================================================================
+        div_threshold = 1e-2
+        sr_threshold_low = 0.005  # 0.5%
+        sr_threshold_high = 0.05  # 5%
 
-        # =========================================================================
-        # 🧠 高级智能门控机制 (RL Usefulness Estimator)
-        # 条件 1: 多样性 > 1e-2 (EA 还在活跃探索期，地形复杂，需要 RL 帮忙)
-        # 条件 2: EMA 成功率 > 1% (说明 RL 最近的指导非常有效，值得继续信任)
-        # 只要满足其一，RL 就保持激活状态。否则冻结，防止 Extrapolation Error 导致崩盘。
-        # =========================================================================
-        is_rl_useful = (diversity > 1e-2) or (self.ema_success_rate > 0.01)
+        # 触发条件：
+        # 1. 常规模式：种群还很分散(需探索)，且 RL 最近至少有一点点苦劳(>0.5%)，则允许继续。
+        # 2. 破局模式：即使种群已经极度收敛(多样性低)，但只要 RL 表现极其神勇(成功率>5%)，说明 RL 正在带队冲锋，绝不喊停。
+        is_rl_useful = (
+                (diversity > div_threshold and self.ema_success_rate > sr_threshold_low)
+                or (self.ema_success_rate > sr_threshold_high)
+        )
 
         n_rl = max(1, int(round(self.pop_size * self.rl_candidate_ratio)))
+
         traj_id = int(self.traj_counter.item())
         step_id = current_step
 
-        num_success = 0
         improvement_sum = 0.0
 
-        # ★ 只有预热结束 且 RL 被评估为“有用”时，才进行动作提出与评估 (极大节省 FEs)
         if is_warmup_over and is_rl_useful:
-            rl_indices = torch.randperm(self.pop_size, device=self.device)[:n_rl]
+            # =========================================================================
+            # 【核心修改 A】：优先抽样！不再随机选，长期停滞的粒子被选中的概率更高
+            # =========================================================================
+            sample_probs = (self.stagnation + 1.0)
+            sample_probs = sample_probs / sample_probs.sum()
+            rl_indices = torch.multinomial(sample_probs, n_rl, replacement=False)
             rl_states = states[rl_indices]
 
-            # 获取 RL 网络输出的动作 (范围被限制在 [-action_scale, action_scale])
             raw_action = self.rl_agent.act(rl_states, noise_std=self.exploration_noise)
 
-            # 【关键修复】：将动作还原为 [-1, 1] 的相对比例
-            normalized_action = raw_action / self.action_scale
+            # =========================================================================
+            # 【核心修改 B】：解析复合动作空间 (Direction + Step Scale + Explore Gate)
+            # =========================================================================
+            # 1. 探索方向 [-1, 1]
+            direction = raw_action[:, :self.dim]
 
-            # 计算当前种群在各个维度上的标准差，作为 "收敛程度感知器"
-            pop_std = torch.std(self.base.pop, dim=0)
+            # 【修复】：强制将方向向量归一化为单位向量 (长度为1)，防止网络通过缩小方向来偷懒
+            direction = direction / (torch.norm(direction, dim=1, keepdim=True) + 1e-8)
 
-            # 加上一个极小的 epsilon 防止后期完全变成 0，导致停滞
-            dynamic_step_size = pop_std + 1e-6
+            # 2. 步长缩放 [0, 1] (将 -1~1 映射到 0~1)
+            step_scale = (raw_action[:, self.dim:self.dim + 1] + 1.0) / 2.0
+            # 3. 探索门控 [0, 1] (0: 纯局部修调 pop_std, 1: 纯全局大跳跃 ub-lb)
+            explore_gate = (raw_action[:, self.dim + 1:self.dim + 2] + 1.0) / 2.0
+            
+            # 【修复问题 1】：加入 10% 的强制全局探索概率，防止网络退化为纯局部搜索
+            if torch.rand(1).item() < 0.1:
+                explore_gate = torch.ones_like(explore_gate)
 
-            # 实际执行的动作 = 相对方向 * 种群标准差 * 探索系数(比如让它在 1.5 倍标准差内探索)
-            actual_scaled_action = normalized_action * dynamic_step_size * 0.3
+            global_scale = (self.ub - self.lb)
 
-            # 叠加到原位置上
-            candidate_pop = pop[rl_indices] + actual_scaled_action
+            # 动态混合有效尺度
+            effective_scale = (1.0 - explore_gate) * pop_std + explore_gate * global_scale
+            dx = direction * effective_scale * step_scale
+
+            candidate_pop = pop[rl_indices] + dx
             candidate_pop = clamp(candidate_pop, self.lb, self.ub)
             candidate_fit = self.evaluate(candidate_pop)
 
-            # 4) Store RL-generated transitions with true evaluations.
-            next_states = self.state_builder.build(candidate_pop, pop[rl_indices], candidate_fit, fit[rl_indices])
-            # 【核心修复 3】：使用 Wrapper 自己的 global_best_fit 计算奖励
-            reward = relative_improvement_reward(fit[rl_indices], candidate_fit,
-                                                 self.global_best_fit.expand_as(candidate_fit))
+            # =========================================================================
+            # 【核心修改 C & 修复问题 8】：组合奖励 (Fitness + Novelty + Escape Bonus)
+            # =========================================================================
+            improved_rl = candidate_fit < fit[rl_indices]
+            next_stag = torch.where(improved_rl, torch.zeros_like(self.stagnation[rl_indices]),
+                                    self.stagnation[rl_indices] + 1)
+            next_states = self.state_builder.build(candidate_pop, pop[rl_indices], candidate_fit, fit[rl_indices],
+                                                   pop_mean, pop_std, next_stag)
+
+            from rl_ea.utils.optimization import compute_novelty_reward
+            fit_reward = relative_improvement_reward(fit[rl_indices], candidate_fit,
+                                                     self.global_best_fit.expand_as(candidate_fit))
+            novelty_reward = compute_novelty_reward(candidate_pop, pop)
+
+            # 【新增：Escape Bonus (逃逸奖励)】
+            # 定义：如果一个粒子卡住超过了 10 代 (T=10)，并且被 RL 一脚踢出坑获得了提升，给予 0.5 的巨大奖励！
+            is_stagnant = self.stagnation[rl_indices] >= 10.0
+            escape_bonus = 0.5 * (is_stagnant.float() * improved_rl.float())
+
+            # 最终的战略级奖励：Fitness (主目标) + Novelty (鼓励走新路) + Escape (鼓励拯救烂摊子)
+            reward = fit_reward + 0.05 * novelty_reward + escape_bonus
+
             done = torch.zeros_like(reward)
-            # future-improvement placeholder; updated from immediate improvement for online usage
             future_improvement = torch.clamp(fit[rl_indices] - candidate_fit, min=0.0)
 
-            traj_id = int(self.traj_counter.item())
-            step_id = int(self.step_counter.item())
             for i in range(n_rl):
                 t = Transition(
                     state=rl_states[i].detach().cpu(),
@@ -198,7 +237,6 @@ class RLEnhancedAlgorithm(Algorithm):
             better = candidate_fit < fit[rl_indices]
 
             num_success = better.sum().item()
-            improvement_sum = 0.0
 
             if better.any():
                 improvement_sum = (fit[rl_indices][better] - candidate_fit[better]).sum().item()
@@ -210,19 +248,17 @@ class RLEnhancedAlgorithm(Algorithm):
                 pop[selected_idx] = candidate_pop[better]
                 fit[selected_idx] = candidate_fit[better]
 
-                # 2. 动态状态重置 (向下兼容 PSO 等含有复杂物理动量的算法)
-                # 如果是 SaDE，因为没有 velocity 属性，会自动安全跳过
+                # 既然获得了提升，重置停滞状态
+                self.stagnation[selected_idx] = 0.0
+
                 if hasattr(self.base, 'velocity'):
                     self.base.velocity[selected_idx] = torch.zeros_like(self.base.velocity[selected_idx])
-
-                # 如果是 PSO，需要同步更新个体的历史最优记录
                 if hasattr(self.base, 'local_best_fit'):
                     compare = self.base.local_best_fit[selected_idx] > candidate_fit[better]
                     lidx = selected_idx[compare]
                     if lidx.numel() > 0:
                         self.base.local_best_location[lidx] = candidate_pop[better][compare].clone()
                         self.base.local_best_fit[lidx] = candidate_fit[better][compare]
-
             # 记录日志统计
             self.log_rl_success += num_success
             self.log_rl_total += n_rl
@@ -251,36 +287,56 @@ class RLEnhancedAlgorithm(Algorithm):
         if hasattr(self.base, 'best_index'):  # 兼容 SaDE
             self.base.best_index = current_best_idx
 
-        # =========================================================================
-        # 6) Store EA transitions (保持不变)
-        # =========================================================================
-        ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
-        ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
-        ea_next_states = states
-        prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit, prev_fit)
-
-        pop_std = torch.std(self.base.pop, dim=0)
-        dynamic_step_size = pop_std + 1e-6
-
-        for i in range(min(self.pop_size, n_rl)):
-            idx = int(i)
-            dx = pop[idx] - self.prev_pop[idx]
-            ea_raw_action = (dx / (dynamic_step_size * 1.5)) * self.action_scale
-            ea_raw_action = torch.clamp(ea_raw_action, -self.action_scale, self.action_scale)
-
-            t = Transition(
-                state=prev_states[idx].detach().cpu(),
-                action=ea_raw_action.detach().cpu(),
-                reward=ea_reward[idx].detach().cpu(),
-                next_state=ea_next_states[idx].detach().cpu(),
-                done=torch.tensor(0.0, device='cpu'),
-                future_improvement=ea_future[idx].detach().cpu(),
-                td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
-                source=0,
-                traj_id=traj_id,
-                step_id=step_id,
-            )
-            self.replay.add(t)
+        # # =========================================================================
+        # # 【核心修改 D】：精准逆向映射 EA 经验到新的复合动作空间
+        # # =========================================================================
+        # ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
+        # ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
+        # ea_next_states = states
+        # 构建一个安全的 prev_fit
+        # prev_fit_safe_for_prev = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
+        # prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit_safe_for_prev,
+        #                                        prev_fit_safe_for_prev, pop_mean, pop_std, self.stagnation)
+        # for i in range(min(self.pop_size, n_rl)):
+        #     idx = int(i)
+        #     dx_ea = pop[idx] - self.prev_pop[idx]
+        #
+        #     # 将 EA 的自然步长逆推为网络输出格式：
+        #     # 假设 explore_gate = 0.0 -> 映射到网络输出为 -1.0
+        #     # 那么 effective_scale = pop_std
+        #     rel_dx = dx_ea / (pop_std + 1e-6)
+        #
+        #     # 提取最大相对尺度作为 step_scale_ea (范围 0~1)
+        #     step_scale_ea = torch.clamp(torch.max(torch.abs(rel_dx)), max=1.0)
+        #
+        #     if step_scale_ea > 1e-6:
+        #         direction_ea = torch.clamp(rel_dx / step_scale_ea, -1.0, 1.0)
+        #     else:
+        #         direction_ea = torch.zeros_like(dx_ea)
+        #
+        #     # 将 step_scale_ea (0~1) 映射回网络的原始范围 (-1~1)
+        #     raw_step_scale = step_scale_ea * 2.0 - 1.0
+        #     raw_explore_gate = torch.tensor([-1.0], device=self.device)
+        #
+        #     ea_raw_action = torch.cat([
+        #         direction_ea,
+        #         raw_step_scale.unsqueeze(0),
+        #         raw_explore_gate
+        #     ])
+        #
+        #     t = Transition(
+        #         state=prev_states[idx].detach().cpu(),
+        #         action=ea_raw_action.detach().cpu(),
+        #         reward=ea_reward[idx].detach().cpu(),
+        #         next_state=ea_next_states[idx].detach().cpu(),
+        #         done=torch.tensor(0.0, device='cpu'),
+        #         future_improvement=ea_future[idx].detach().cpu(),
+        #         td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
+        #         source=0,
+        #         traj_id=traj_id,
+        #         step_id=step_id,
+        #     )
+        #     self.replay.add(t)
 
         # =========================================================================
         # 7) Train RL from replay
@@ -289,9 +345,11 @@ class RLEnhancedAlgorithm(Algorithm):
         info = {}
         if len(self.replay) >= self.train_after and is_warmup_over and is_rl_useful:
             for _ in range(self.train_steps_per_gen):
-                batch = self.replay.sample(self.batch_size, rl_ratio=0.5)
+                # 【修复】：去掉 rl_ratio 参数，只使用 RL 经验
+                batch = self.replay.sample(self.batch_size)
                 info = self.rl_agent.update(batch)
                 self.replay.update_td_priorities(batch['indices'].tolist(), info['td_error'])
+
         # =========================================================================
         # 8) Logging with Population Diversity Monitor
         # =========================================================================
@@ -299,10 +357,6 @@ class RLEnhancedAlgorithm(Algorithm):
         if current_step > 0 and current_step % 50 == 0:
             success_rate = self.log_rl_success / max(1, self.log_rl_total)
             avg_imp = self.log_rl_improve / max(1, self.log_rl_success)
-
-            # 【重要指标】：计算种群平均标准差，监控多样性
-            diversity = pop_std.mean().item()
-
             print(
                 f"   [RL Log Gen {current_step}] 成功率: {success_rate:.2%} ({self.log_rl_success}/{self.log_rl_total}) | 平均提升: {avg_imp:.2e} | 种群多样性: {diversity:.4e}")
             if 'critic_loss' in info:
@@ -316,3 +370,5 @@ class RLEnhancedAlgorithm(Algorithm):
         self.prev_pop = self.base.pop.clone()
         self.prev_fit = self.base.fit.clone()
         self.step_counter = self.step_counter + 1
+
+        self.traj_counter = self.traj_counter + 1

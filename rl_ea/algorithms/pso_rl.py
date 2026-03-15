@@ -32,9 +32,13 @@ def make_rl_pso(
         return base
 
     dim = lb.shape[0]
-    state_dim = 2 * dim + 2
-    action_dim = dim
-    max_action = (ub - lb).to(device) * 0.01
+    # 【核心修改 1】：State 增加 2 维标量 (diversity, stagnation)
+    state_dim = 2 * dim + 4
+
+    # 【核心修改 2】：Action 变为 3 组复合输出
+    # 维度构成: direction(D维) + step_scale(1维) + explore_gate(1维) = dim + 2
+    action_dim = dim + 2
+    max_action = torch.ones(action_dim, device=device)
     agent = TD3Agent(state_dim, action_dim, max_action=max_action, device=device, cfg=TD3Config())
     replay = PrioritizedReplayBuffer(capacity=replay_capacity, device=device)
     algo = RLEnhancedAlgorithm(

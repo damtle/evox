@@ -23,3 +23,17 @@ def compute_future_improvement(fits: torch.Tensor) -> torch.Tensor:
     """
     best_suffix = torch.minimum(torch.flip(torch.cummin(torch.flip(fits, dims=[0]), dim=0).values, dims=[0]), fits)
     return fits - best_suffix
+
+
+def compute_novelty_reward(candidate_pop: torch.Tensor, pop: torch.Tensor) -> torch.Tensor:
+    """计算 Novelty Reward: 鼓励 RL 探索种群尚未覆盖的新区域"""
+    cdist = torch.cdist(candidate_pop, pop)
+    min_dist = cdist.min(dim=1).values
+
+    # 【修复问题 5】：用当前种群的内部平均距离作为标尺
+    pop_dists = torch.cdist(pop, pop)
+    scale = pop_dists.mean().detach()
+
+    # 防止 scale 为 0 导致除以 0
+    novelty = min_dist / (scale + 1e-8)
+    return torch.clamp(novelty, min=0.0, max=1.0)

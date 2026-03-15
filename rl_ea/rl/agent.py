@@ -64,10 +64,15 @@ class TD3Agent:
             target_q = torch.min(target_q1, target_q2)
             y = r + (1.0 - d) * self.cfg.gamma * target_q
 
+            # 【修复 6-1：目标 Q 值截断】防止 Q 值在自举过程中滚雪球式爆炸
+            y = torch.clamp(y, -10.0, 10.0)
+
         q1, q2 = self.critic(s, a)
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
         self.critic_opt.zero_grad()
         critic_loss.backward()
+        # 【修复 6-2：Critic 梯度裁剪】把 Critic 的梯度长度强行限制在 1.0 以内
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_opt.step()
 
         td_error = (q1.detach() - y).abs().squeeze(-1)
@@ -81,6 +86,7 @@ class TD3Agent:
             actor_loss = -self.critic.q1_only(s, self.actor(s)).mean()
             self.actor_opt.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
 
             self._soft_update(self.actor, self.actor_target)

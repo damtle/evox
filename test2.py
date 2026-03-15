@@ -77,8 +77,8 @@ def main():
 
     for func_id in range(1, 13):
         print(f"\n正在运行 F{func_id}...")
-        if func_id < 6:
-            continue
+        # if func_id < 6:
+        #     continue
         # 1. 跑纯 EA 基准
         best_baseline, hist_baseline = run_experiment(func_id, dim, enable_rl=False, max_generations=max_generations)
         # 2. 跑 RL 增强的 EA
