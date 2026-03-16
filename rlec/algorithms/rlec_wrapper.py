@@ -147,8 +147,10 @@ class RLECWrapper(Algorithm):
         # 2. PPO-LSTM 大脑思考，生成新指令
         # state: [1, 12]
         action_raw, intent_np, log_prob, value = self.rl_agent.select_action(
-            state.squeeze(0), deterministic=False
+            state, deterministic=False
         )
+
+        self.last_state = state.clone()
 
         # 3. 翻译官翻译指令
         intent_tensor = torch.tensor(intent_np, device=self.device, dtype=torch.float32)
@@ -156,7 +158,6 @@ class RLECWrapper(Algorithm):
         # 传入 initial_div
         cmd = self.interpreter.interpret(intent_obj, current_fit, self.stagnation, self.initial_div.item())
 
-        self.last_state = state.squeeze(0).clone()
         self.last_action_raw = torch.tensor(action_raw, device=self.device)
         self.last_intent = intent_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device)

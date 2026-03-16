@@ -113,7 +113,7 @@ def main():
         for run in range(num_runs):
             current_seed = 42 + run * 100
 
-            best_b, hist_b, base_algo_name = run_experiment(func_id, dim, False, max_generations, current_seed)
+            best_b, hist_b, _, base_algo_name = run_experiment(func_id, dim, False, max_generations, current_seed)
             histories_base.append(hist_b)
             best_vals_base.append(best_b)
 

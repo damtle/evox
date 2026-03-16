@@ -145,7 +145,7 @@ def main():
         for run in range(num_runs):
             current_seed = 42 + run * 100
 
-            best_b, hist_b, base_algo_name = run_experiment(func_id, dim, False, max_generations, current_seed)
+            best_b, hist_b, _, base_algo_name = run_experiment(func_id, dim, False, max_generations, current_seed)
             histories_base.append(hist_b)
             best_vals_base.append(best_b)
 
@@ -228,23 +228,543 @@ if __name__ == "__main__":
 
 ==================================================
 
-// [MODULE] File: rlec\__init__.py
+// [MODULE] File: rlec/__init__.py
 ----------------------------------------
 
 
 ==================================================
 
-// [MODULE] File: rlec\algorithms\__init__.py
+// [MODULE] File: rlec/features/__init__.py
 ----------------------------------------
 
 
 ==================================================
 
-// [MODULE] File: rlec\algorithms\code_rlec.py
+// [MODULE] File: rlec/features/macro_state.py
+----------------------------------------
+import torch
+from rlec.utils.population_metrics import (
+    compute_diversity,
+    compute_fitness_skewness,
+    compute_rank_entropy,
+    compute_stagnation_ratio,
+    compute_elite_separation  # 引入新特征
+)
+
+
+class MacroStateBuilder:
+    def __init__(self, dim: int, pop_size: int):
+        self.dim = dim
+        self.pop_size = pop_size
+        self.state_dim = 13  # 【修改】：状态维度提升为 13
+
+    def build(self,
+              pop_t: torch.Tensor, fit_t: torch.Tensor,
+              pop_t_minus_k: torch.Tensor, fit_t_minus_k: torch.Tensor,
+              stagnation: torch.Tensor,
+              last_action: torch.Tensor, last_roi: float) -> torch.Tensor:
+        device = pop_t.device
+
+        # 1. 进展特征
+        best_t = torch.min(fit_t)
+        best_t_k = torch.min(fit_t_minus_k)
+        median_t = torch.median(fit_t)
+        median_t_k = torch.median(fit_t_minus_k)
+
+        prog_best = (best_t_k - best_t) / (torch.abs(best_t_k) + 1e-8)
+        prog_median = (median_t_k - median_t) / (torch.abs(median_t_k) + 1e-8)
+
+        # 2. 结构特征
+        div_t = compute_diversity(pop_t)
+        div_t_k = compute_diversity(pop_t_minus_k)
+        div_change = (div_t - div_t_k) / (div_t_k + 1e-8)
+        stag_ratio = compute_stagnation_ratio(stagnation, threshold=10)
+
+        # 【必须改 4 应用】：计算分离度
+        separation = compute_elite_separation(pop_t, fit_t)
+
+        # 3. 分布特征
+        skewness = compute_fitness_skewness(fit_t)
+        entropy = compute_rank_entropy(fit_t)
+
+        # 4. 控制历史
+        roi_tensor = torch.tensor([last_roi], device=device)
+
+        state = torch.cat([
+            torch.clamp(prog_best.unsqueeze(0), -5.0, 5.0),
+            torch.clamp(prog_median.unsqueeze(0), -5.0, 5.0),
+            torch.clamp(div_t.unsqueeze(0) / 100.0, 0.0, 5.0),
+            torch.clamp(div_change.unsqueeze(0), -1.0, 1.0),
+            stag_ratio.unsqueeze(0),
+            skewness.unsqueeze(0) / 5.0,
+            entropy.unsqueeze(0),
+            torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),  # 新增：聚类分离度
+            roi_tensor,
+            last_action[0].unsqueeze(0),
+            last_action[1].unsqueeze(0),
+            last_action[3].unsqueeze(0),
+            last_action[4].unsqueeze(0),
+        ], dim=0)
+
+        return state.unsqueeze(0)  # [1, 13]
+
+==================================================
+
+// [MODULE] File: rlec/features/stage_reward.py
+----------------------------------------
+import torch
+
+
+class StageRewardCalculator:
+    def __init__(self, w_best=2.0, w_median=0.5, w_div=0.2, w_rescue=1.0, w_cost=0.5, w_collapse=1.0):
+        self.w_best = w_best
+        self.w_median = w_median
+        self.w_div = w_div
+        self.w_rescue = w_rescue
+        self.w_cost = w_cost
+        self.w_collapse = w_collapse  # 新增：塌缩惩罚权重
+
+    def calculate(self,
+                  fit_start: torch.Tensor, fit_end: torch.Tensor,
+                  div_start: float, div_end: float, target_div: float, initial_div: float,
+                  stagnation_start: torch.Tensor, stag_ratio: float,
+                  action: torch.Tensor) -> float:
+
+        # 1. 最优值收益
+        best_start, best_end = torch.min(fit_start), torch.min(fit_end)
+        r_best = torch.log1p(torch.relu(best_start - best_end)) / (torch.log1p(torch.abs(best_start)) + 1e-8)
+
+        # 2. 中位数收益
+        median_start, median_end = torch.median(fit_start), torch.median(fit_end)
+        r_median = torch.log1p(torch.relu(median_start - median_end)) / (torch.log1p(torch.abs(median_start)) + 1e-8)
+
+        # 3. 多样性控制收益 (向目标靠拢)
+        err_start = abs(div_start - target_div)
+        err_end = abs(div_end - target_div)
+        r_div = (err_start - err_end) / (initial_div + 1e-8)
+
+        # 4. 停滞脱困收益
+        is_stagnant_start = (stagnation_start >= 10)
+        num_stagnant = is_stagnant_start.sum().item()
+        if num_stagnant > 0:
+            rel_improve = (fit_start - fit_end) / (torch.abs(fit_start) + 1e-8)
+            r_rescue = (is_stagnant_start & (rel_improve > 1e-4)).sum().item() / num_stagnant
+        else:
+            r_rescue = 0.0
+
+        # 5. 干预成本
+        c_intervene = (action[3].item() + action[4].item()) / 2.0
+
+        # 6. 【必须改 4 应用】：过早塌缩惩罚 (Collapse Penalty)
+        # 如果多样性跌破初始值的 1% (极度塌缩)，且全场有大量粒子处于停滞期，严惩！
+        tau_div = initial_div * 0.01
+        collapse_penalty = 0.0
+        if div_end < tau_div and stag_ratio > 0.5:
+            collapse_penalty = (tau_div - div_end) / tau_div * stag_ratio
+
+        total_reward = (
+                self.w_best * r_best.item() +
+                self.w_median * r_median.item() +
+                self.w_div * r_div +
+                self.w_rescue * r_rescue -
+                self.w_cost * c_intervene -
+                self.w_collapse * collapse_penalty
+        )
+
+        roi = total_reward / (c_intervene + 1e-4)
+        return total_reward, roi
+
+==================================================
+
+// [MODULE] File: rlec/control/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec/control/intent_vector.py
+----------------------------------------
+import torch
+from dataclasses import dataclass
+
+
+@dataclass
+class IntentVector:
+    """
+    RLEC 战略意图向量 (6D)
+    所有值均被规范化到 [0, 1] 范围内
+    """
+    e_t: float  # Exploration pressure (探索压力): 鼓励大跨度搜索，容忍变差
+    x_t: float  # Exploitation pressure (开发压力): 鼓励局部微调，严格要求提升
+    d_t: float  # Diversity target (多样性目标): 0.0 代表允许坍缩，1.0 代表极度分散
+    b_t: float  # Intervention budget (干预预算): 本阶段允许干预的最大个体比例
+    r_t: float  # Rescue budget (脱困预算): 给停滞个体分配的重构资源比例
+    p_t: float  # Elite protection (精英保护): 精英个体免受随机扰动的保护强度
+
+    @classmethod
+    def from_tensor(cls, action_tensor: torch.Tensor) -> 'IntentVector':
+        """
+        将 PPO 网络的输出（通常在 [-1, 1] 之间）映射到 [0, 1] 的物理意图区间
+        """
+        a = torch.clamp(action_tensor.squeeze(), 0.0, 1.0).tolist()
+
+        return cls(
+            e_t=a[0], x_t=a[1], d_t=a[2],
+            b_t=a[3], r_t=a[4], p_t=a[5]
+        )
+
+    def __repr__(self):
+        return (f"Intent[Explor:{self.e_t:.2f}, Exploit:{self.x_t:.2f}, Div:{self.d_t:.2f}, "
+                f"Budget:{self.b_t:.2f}, Rescue:{self.r_t:.2f}, Elite:{self.p_t:.2f}]")
+
+==================================================
+
+// [MODULE] File: rlec/control/interpreter.py
+----------------------------------------
+import torch
+from dataclasses import dataclass
+from .intent_vector import IntentVector
+
+
+@dataclass
+class EACommand:
+    protected_mask: torch.Tensor
+    rescue_mask: torch.Tensor
+    middle_mask: torch.Tensor  # 新增：中间组标识
+    step_scales: torch.Tensor
+    alpha_margin: float  # 新增：相对容忍度
+    beta_margin: float  # 新增：绝对容忍度 (防止后期 f 极小时门槛过死)
+    target_diversity: float
+
+
+class ControlInterpreter:
+    def __init__(self, pop_size: int, max_stagnation: int = 10):
+        self.pop_size = pop_size
+        self.max_stag = max_stagnation
+
+    def interpret(self, intent: IntentVector, fit: torch.Tensor,
+                  stagnation: torch.Tensor, initial_div: float) -> EACommand:
+        device = fit.device
+        N = self.pop_size
+
+        # --- 1. 优先度与干预预算 (b_t) ---
+        _, rank_idx = torch.sort(fit, descending=True)
+        rank_percentile = torch.empty(N, device=device)
+        rank_percentile[rank_idx] = torch.arange(N, dtype=torch.float32, device=device) / (N - 1)
+
+        # 【建议修 2】：让分数偏向“中间层”(mid_pref)，而不是单纯的头部
+        mid_pref = 1.0 - torch.abs(rank_percentile - 0.5) * 2.0
+        score = 0.6 * (stagnation / self.max_stag) + 0.4 * mid_pref
+
+        n_intervene = int(N * intent.b_t)
+
+        intervene_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        if n_intervene > 0:
+            _, intervene_idx = torch.topk(score, n_intervene)
+            intervene_mask[intervene_idx] = True
+
+        # --- 2. 精英保护指令 (p_t) ---
+        k_elite = max(1, int(N * 0.10 * intent.p_t))
+        _, sorted_indices = torch.sort(fit)
+        protected_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        if intent.p_t > 0.05:
+            protected_mask[sorted_indices[:k_elite]] = True
+
+        # 【建议修 2】：让精英绝对免于被算作“常规干预预算 (b_t)”
+        intervene_mask = intervene_mask & (~protected_mask)
+        # --- 3. 救援预算指令 (r_t) ---
+        num_rescue = int(n_intervene * intent.r_t)
+        rescue_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        if num_rescue > 0:
+            intervene_stag = stagnation.clone()
+            intervene_stag[~intervene_mask] = -1.0
+            _, rescue_idx = torch.topk(intervene_stag, num_rescue)
+            rescue_mask[rescue_idx] = True
+        rescue_mask = rescue_mask & (~protected_mask)
+
+        # --- 4. 中间组定位 (Middle Group) ---
+        # 既不是被保护的精英，也不是被抢救的停滞个体，承担定向扩散主力！
+        middle_mask = intervene_mask & (~rescue_mask) & (~protected_mask)
+
+        # --- 5. 物理步长缩放分配 (Scales) ---
+        global_scale = 1.0 + 2.0 * intent.e_t
+        local_scale = 1.0 - 0.9 * intent.x_t
+
+        step_scales = torch.ones(N, device=device)
+        # 中间组：受探索和开发的混合牵引 (e_t主导扩散，x_t主导收敛)
+        step_scales[middle_mask] = 1.0 + intent.e_t - 0.5 * intent.x_t
+        step_scales[rescue_mask] = global_scale
+        # step_scales[intervene_mask & protected_mask] = local_scale
+
+        # --- 6. 阶段接受门槛 (Relative + Absolute) ---
+        # 相对比例 alpha_margin
+        alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
+        # 绝对底线 beta_margin (防止 |f| 接近 0 时，margin 退化为 0)
+        beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
+
+        # --- 7. 稳健的多样性目标 ---
+        # 彻底摆脱“当前状态的线性缩放”，严格锚定最初代的原始分布！
+        # d_t=0.5时维持初始一半，d_t=1.0时扩到初始规模
+        target_diversity = initial_div * (0.1 + 0.9 * intent.d_t)
+
+        return EACommand(
+            protected_mask=protected_mask, rescue_mask=rescue_mask, middle_mask=middle_mask,
+            step_scales=step_scales, alpha_margin=alpha_margin, beta_margin=beta_margin,
+            target_diversity=target_diversity
+        )
+
+==================================================
+
+// [MODULE] File: rlec/rl/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec/rl/networks.py
+----------------------------------------
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
+
+class ActorMLP(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        # 强力 MLP 提取 13 维宏观特征
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        # 独立的可训练对数标准差（控制探索方差）
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+    def forward(self, state):
+        mean = self.net(state)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+class CriticMLP(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state):
+        return self.net(state)
+
+==================================================
+
+// [MODULE] File: rlec/rl/ppo_lstm.py
+----------------------------------------
+import torch
+import torch.nn as nn
+import numpy as np
+from .networks import ActorMLP, CriticMLP
+from .rollout_buffer import RolloutBuffer
+
+
+class PPO:
+    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
+                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.2,
+                 entropy_coef=0.01, k_epochs=4):
+        self.device = device
+        self.gamma = gamma
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.k_epochs = k_epochs
+
+        self.actor = ActorMLP(state_dim, action_dim).to(device)
+        self.critic = CriticMLP(state_dim).to(device)
+
+        self.optimizer = torch.optim.Adam([
+            {'params': self.actor.parameters(), 'lr': lr_actor},
+            {'params': self.critic.parameters(), 'lr': lr_critic}
+        ])
+        self.buffer = RolloutBuffer(device)
+
+    def select_action(self, state: torch.Tensor, deterministic=False):
+        with torch.no_grad():
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+
+            dist = self.actor(state)
+            value = self.critic(state)
+            action = dist.mean if deterministic else dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1)
+
+            raw_action = torch.clamp(action, -4.0, 4.0)
+            intent_action = torch.sigmoid(raw_action)
+
+        return (
+            action.squeeze(0).cpu().numpy(),
+            intent_action.squeeze(0).cpu().numpy(),
+            log_prob.squeeze(0).item(),
+            value.squeeze(0).item()
+        )
+
+    def update(self):
+        if len(self.buffer.states) == 0: return {}
+
+        states = torch.stack(self.buffer.states).to(self.device)
+        actions = torch.stack(self.buffer.actions).to(self.device)
+        old_log_probs = torch.tensor(self.buffer.log_probs, device=self.device)
+
+        with torch.no_grad():
+            next_value = self.critic(states[-1:]).item()
+
+        returns, advantages = self.buffer.compute_gae(next_value, self.gamma)
+        actor_loss_list, critic_loss_list = [], []
+
+        for _ in range(self.k_epochs):
+            dist = self.actor(states)
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1).mean()
+
+            ratios = torch.exp(log_probs - old_log_probs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
+
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+            values = self.critic(states).reshape(-1)
+            returns = returns.reshape(-1)
+            critic_loss = nn.MSELoss()(values, returns)
+
+            loss = actor_loss + 0.5 * critic_loss
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            self.optimizer.step()
+
+            actor_loss_list.append(actor_loss.item())
+            critic_loss_list.append(critic_loss.item())
+
+        self.buffer.clear()
+        return {"actor_loss": np.mean(actor_loss_list), "critic_loss": np.mean(critic_loss_list)}
+
+==================================================
+
+// [MODULE] File: rlec/rl/rollout_buffer.py
+----------------------------------------
+import torch
+
+class RolloutBuffer:
+    """PPO 专用的 On-policy 轨迹缓冲池"""
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.clear()
+
+    def clear(self):
+        self.states, self.actions, self.rewards = [], [], []
+        self.values, self.log_probs, self.dones = [], [], []
+
+    def add(self, state, action, reward, value, log_prob, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.log_probs.append(log_prob)
+        self.dones.append(done)
+
+    def compute_gae(self, next_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        values = torch.tensor(self.values + [next_value], dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+
+        advantages = torch.zeros(len(rewards), dtype=torch.float32, device=self.device)
+        last_gae = 0.0
+
+        for t in reversed(range(len(rewards))):
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
+            advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
+
+        returns = advantages + values[:-1]
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return returns, advantages
+
+==================================================
+
+// [MODULE] File: rlec/utils/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec/utils/population_metrics.py
+----------------------------------------
+import torch
+
+
+def compute_diversity(pop: torch.Tensor) -> torch.Tensor:
+    return torch.std(pop, dim=0).mean()
+
+
+def compute_fitness_skewness(fit: torch.Tensor) -> torch.Tensor:
+    mean = fit.mean()
+    std = fit.std() + 1e-8
+    skewness = torch.mean(((fit - mean) / std) ** 3)
+    return torch.clamp(skewness, -5.0, 5.0)
+
+
+def compute_rank_entropy(fit: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    norm_fit = (fit - fit.mean()) / (fit.std() + 1e-8)
+    probs = torch.softmax(-norm_fit / temperature, dim=0)
+    entropy = -(probs * torch.log(probs + 1e-8)).sum()
+    max_entropy = torch.log(torch.tensor(float(fit.shape[0]), device=fit.device))
+    return entropy / max_entropy
+
+
+def compute_stagnation_ratio(stagnation: torch.Tensor, threshold: int = 10) -> torch.Tensor:
+    stagnant_count = (stagnation >= threshold).sum().float()
+    return stagnant_count / stagnation.shape[0]
+
+
+# 【必须改 4】：新增聚类分离度特征，识别种群是否塌缩为单峰
+def compute_elite_separation(pop: torch.Tensor, fit: torch.Tensor, q: float = 0.1) -> torch.Tensor:
+    """计算精英簇与其他个体之间的分离度 (分离度越高，说明盆地越多/结构越清晰)"""
+    N = pop.shape[0]
+    k = max(1, int(N * q))
+
+    _, indices = torch.sort(fit)
+    elite_idx = indices[:k]
+    non_elite_idx = indices[k:]
+
+    elite_pop = pop[elite_idx]
+    non_elite_pop = pop[non_elite_idx]
+
+    # 找到精英簇的中心点
+    elite_center = elite_pop.mean(dim=0)
+
+    # 精英簇内部的紧凑度
+    elite_spread = torch.norm(elite_pop - elite_center, dim=1).mean()
+    # 大众个体离精英中心的平均距离
+    separation = torch.norm(non_elite_pop - elite_center, dim=1).mean()
+
+    # 比例越大，说明种群不仅有精英，还有大量个体在远方探索 (多模态结构)
+    return separation / (elite_spread + 1e-8)
+
+==================================================
+
+// [MODULE] File: rlec/algorithms/__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec/algorithms/code_rlec.py
 ----------------------------------------
 from typing import Optional
 import torch
-from evox.algorithms import CoDE
+from evox.algorithms import CoDE, DE
 from rlec.algorithms.rlec_wrapper import RLECWrapper
 
 
@@ -261,7 +781,7 @@ def make_rlec_code(
     快速创建一个被 RLEC 控制器包裹的 CoDE 算法实例
     """
     device = torch.get_default_device() if device is None else device
-    base_code = CoDE(pop_size, lb, ub, device=device)
+    base_code = DE(pop_size, lb, ub, device=device)
 
     if not enable_rl:
         return base_code
@@ -276,7 +796,7 @@ def make_rlec_code(
 
 ==================================================
 
-// [MODULE] File: rlec\algorithms\rlec_wrapper.py
+// [MODULE] File: rlec/algorithms/rlec_wrapper.py
 ----------------------------------------
 from typing import Optional
 import torch
@@ -329,6 +849,8 @@ class RLECWrapper(Algorithm):
         self.initial_div = Mutable(torch.tensor(0.0, device=self.device))
         self.current_cmd_alpha_margin = Mutable(torch.tensor(0.0, device=self.device))
         self.current_cmd_beta_margin = Mutable(torch.tensor(0.0, device=self.device))
+
+        self.current_cmd_scales = Mutable(torch.ones(self.pop_size, device=self.device))
 
         # ================= 时序追踪状态 =================
         self.step_counter = Mutable(torch.tensor(0, device=self.device))
@@ -425,8 +947,10 @@ class RLECWrapper(Algorithm):
         # 2. PPO-LSTM 大脑思考，生成新指令
         # state: [1, 12]
         action_raw, intent_np, log_prob, value = self.rl_agent.select_action(
-            state.squeeze(0), deterministic=False
+            state, deterministic=False
         )
+
+        self.last_state = state.clone()
 
         # 3. 翻译官翻译指令
         intent_tensor = torch.tensor(intent_np, device=self.device, dtype=torch.float32)
@@ -434,7 +958,6 @@ class RLECWrapper(Algorithm):
         # 传入 initial_div
         cmd = self.interpreter.interpret(intent_obj, current_fit, self.stagnation, self.initial_div.item())
 
-        self.last_state = state.squeeze(0).clone()
         self.last_action_raw = torch.tensor(action_raw, device=self.device)
         self.last_intent = intent_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device)
@@ -442,21 +965,21 @@ class RLECWrapper(Algorithm):
 
         self.current_cmd_protected = cmd.protected_mask
         self.current_cmd_rescue = cmd.rescue_mask
-        self.current_cmd_scales = Mutable(torch.ones(self.pop_size, device=self.device))
+        self.current_cmd_scales = cmd.step_scales.clone()
         # 记录双容忍度
         self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
         self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
         self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
 
-        # 5. 【硬核战术动作：破局救援】
-        # 在阶段初，对被标记为 rescue 的粒子施加无视物理规律的随机传送！
-        rescue_idx = torch.where(cmd.rescue_mask)[0]
-        if len(rescue_idx) > 0:
-            new_pos = self.lb + torch.rand(len(rescue_idx), self.dim, device=self.device) * (self.ub - self.lb)
-            self.base.pop[rescue_idx] = new_pos
-            self.base.fit[rescue_idx] = self.evaluate(new_pos)
-            # 重新计算救援后的真实多样性
-            current_div = compute_diversity(self.base.pop)
+        # # 5. 【硬核战术动作：破局救援】
+        # # 在阶段初，对被标记为 rescue 的粒子施加无视物理规律的随机传送！
+        # rescue_idx = torch.where(cmd.rescue_mask)[0]
+        # if len(rescue_idx) > 0:
+        #     new_pos = self.lb + torch.rand(len(rescue_idx), self.dim, device=self.device) * (self.ub - self.lb)
+        #     self.base.pop[rescue_idx] = new_pos
+        #     self.base.fit[rescue_idx] = self.evaluate(new_pos)
+        #     # 重新计算救援后的真实多样性
+        #     current_div = compute_diversity(self.base.pop)
 
         # 6. 更新新阶段的起点锚点 (此时种群已经是救援后的干净状态了)
         self.stage_start_pop = self.base.pop.clone()
@@ -588,519 +1111,6 @@ class RLECWrapper(Algorithm):
             self.base.global_best_location = self.global_best_location.clone()
 
         self.step_counter = self.step_counter + 1
-
-==================================================
-
-// [MODULE] File: rlec\control\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\control\intent_vector.py
-----------------------------------------
-import torch
-from dataclasses import dataclass
-
-
-@dataclass
-class IntentVector:
-    """
-    RLEC 战略意图向量 (6D)
-    所有值均被规范化到 [0, 1] 范围内
-    """
-    e_t: float  # Exploration pressure (探索压力): 鼓励大跨度搜索，容忍变差
-    x_t: float  # Exploitation pressure (开发压力): 鼓励局部微调，严格要求提升
-    d_t: float  # Diversity target (多样性目标): 0.0 代表允许坍缩，1.0 代表极度分散
-    b_t: float  # Intervention budget (干预预算): 本阶段允许干预的最大个体比例
-    r_t: float  # Rescue budget (脱困预算): 给停滞个体分配的重构资源比例
-    p_t: float  # Elite protection (精英保护): 精英个体免受随机扰动的保护强度
-
-    @classmethod
-    def from_tensor(cls, action_tensor: torch.Tensor) -> 'IntentVector':
-        """
-        将 PPO 网络的输出（通常在 [-1, 1] 之间）映射到 [0, 1] 的物理意图区间
-        """
-        a = torch.clamp(action_tensor.squeeze(), 0.0, 1.0).tolist()
-
-        return cls(
-            e_t=a[0], x_t=a[1], d_t=a[2],
-            b_t=a[3], r_t=a[4], p_t=a[5]
-        )
-
-    def __repr__(self):
-        return (f"Intent[Explor:{self.e_t:.2f}, Exploit:{self.x_t:.2f}, Div:{self.d_t:.2f}, "
-                f"Budget:{self.b_t:.2f}, Rescue:{self.r_t:.2f}, Elite:{self.p_t:.2f}]")
-
-==================================================
-
-// [MODULE] File: rlec\control\interpreter.py
-----------------------------------------
-import torch
-from dataclasses import dataclass
-from .intent_vector import IntentVector
-
-
-@dataclass
-class EACommand:
-    protected_mask: torch.Tensor
-    rescue_mask: torch.Tensor
-    middle_mask: torch.Tensor  # 新增：中间组标识
-    step_scales: torch.Tensor
-    alpha_margin: float  # 新增：相对容忍度
-    beta_margin: float  # 新增：绝对容忍度 (防止后期 f 极小时门槛过死)
-    target_diversity: float
-
-
-class ControlInterpreter:
-    def __init__(self, pop_size: int, max_stagnation: int = 10):
-        self.pop_size = pop_size
-        self.max_stag = max_stagnation
-
-    def interpret(self, intent: IntentVector, fit: torch.Tensor,
-                  stagnation: torch.Tensor, initial_div: float) -> EACommand:
-        device = fit.device
-        N = self.pop_size
-
-        # --- 1. 优先度与干预预算 (b_t) ---
-        _, rank_idx = torch.sort(fit, descending=True)
-        rank_percentile = torch.empty(N, device=device)
-        rank_percentile[rank_idx] = torch.arange(N, dtype=torch.float32, device=device) / (N - 1)
-
-        # 【建议修 2】：让分数偏向“中间层”(mid_pref)，而不是单纯的头部
-        mid_pref = 1.0 - torch.abs(rank_percentile - 0.5) * 2.0
-        score = 0.6 * (stagnation / self.max_stag) + 0.4 * mid_pref
-
-        n_intervene = int(N * intent.b_t)
-
-        intervene_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        if n_intervene > 0:
-            _, intervene_idx = torch.topk(score, n_intervene)
-            intervene_mask[intervene_idx] = True
-
-        # --- 2. 精英保护指令 (p_t) ---
-        k_elite = max(1, int(N * 0.10 * intent.p_t))
-        _, sorted_indices = torch.sort(fit)
-        protected_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        if intent.p_t > 0.05:
-            protected_mask[sorted_indices[:k_elite]] = True
-
-        # 【建议修 2】：让精英绝对免于被算作“常规干预预算 (b_t)”
-        intervene_mask = intervene_mask & (~protected_mask)
-        # --- 3. 救援预算指令 (r_t) ---
-        num_rescue = int(n_intervene * intent.r_t)
-        rescue_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        if num_rescue > 0:
-            intervene_stag = stagnation.clone()
-            intervene_stag[~intervene_mask] = -1.0
-            _, rescue_idx = torch.topk(intervene_stag, num_rescue)
-            rescue_mask[rescue_idx] = True
-        rescue_mask = rescue_mask & (~protected_mask)
-
-        # --- 4. 中间组定位 (Middle Group) ---
-        # 既不是被保护的精英，也不是被抢救的停滞个体，承担定向扩散主力！
-        middle_mask = intervene_mask & (~rescue_mask) & (~protected_mask)
-
-        # --- 5. 物理步长缩放分配 (Scales) ---
-        global_scale = 1.0 + 2.0 * intent.e_t
-        local_scale = 1.0 - 0.9 * intent.x_t
-
-        step_scales = torch.ones(N, device=device)
-        # 中间组：受探索和开发的混合牵引 (e_t主导扩散，x_t主导收敛)
-        step_scales[middle_mask] = 1.0 + intent.e_t - 0.5 * intent.x_t
-        step_scales[rescue_mask] = global_scale
-        step_scales[intervene_mask & protected_mask] = local_scale
-
-        # --- 6. 阶段接受门槛 (Relative + Absolute) ---
-        # 相对比例 alpha_margin
-        alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
-        # 绝对底线 beta_margin (防止 |f| 接近 0 时，margin 退化为 0)
-        beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
-
-        # --- 7. 稳健的多样性目标 ---
-        # 彻底摆脱“当前状态的线性缩放”，严格锚定最初代的原始分布！
-        # d_t=0.5时维持初始一半，d_t=1.0时扩到初始规模
-        target_diversity = initial_div * (0.1 + 0.9 * intent.d_t)
-
-        return EACommand(
-            protected_mask=protected_mask, rescue_mask=rescue_mask, middle_mask=middle_mask,
-            step_scales=step_scales, alpha_margin=alpha_margin, beta_margin=beta_margin,
-            target_diversity=target_diversity
-        )
-
-==================================================
-
-// [MODULE] File: rlec\features\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\features\macro_state.py
-----------------------------------------
-import torch
-from rlec.utils.population_metrics import (
-    compute_diversity,
-    compute_fitness_skewness,
-    compute_rank_entropy,
-    compute_stagnation_ratio,
-    compute_elite_separation  # 引入新特征
-)
-
-
-class MacroStateBuilder:
-    def __init__(self, dim: int, pop_size: int):
-        self.dim = dim
-        self.pop_size = pop_size
-        self.state_dim = 13  # 【修改】：状态维度提升为 13
-
-    def build(self,
-              pop_t: torch.Tensor, fit_t: torch.Tensor,
-              pop_t_minus_k: torch.Tensor, fit_t_minus_k: torch.Tensor,
-              stagnation: torch.Tensor,
-              last_action: torch.Tensor, last_roi: float) -> torch.Tensor:
-        device = pop_t.device
-
-        # 1. 进展特征
-        best_t = torch.min(fit_t)
-        best_t_k = torch.min(fit_t_minus_k)
-        median_t = torch.median(fit_t)
-        median_t_k = torch.median(fit_t_minus_k)
-
-        prog_best = (best_t_k - best_t) / (torch.abs(best_t_k) + 1e-8)
-        prog_median = (median_t_k - median_t) / (torch.abs(median_t_k) + 1e-8)
-
-        # 2. 结构特征
-        div_t = compute_diversity(pop_t)
-        div_t_k = compute_diversity(pop_t_minus_k)
-        div_change = (div_t - div_t_k) / (div_t_k + 1e-8)
-        stag_ratio = compute_stagnation_ratio(stagnation, threshold=10)
-
-        # 【必须改 4 应用】：计算分离度
-        separation = compute_elite_separation(pop_t, fit_t)
-
-        # 3. 分布特征
-        skewness = compute_fitness_skewness(fit_t)
-        entropy = compute_rank_entropy(fit_t)
-
-        # 4. 控制历史
-        roi_tensor = torch.tensor([last_roi], device=device)
-
-        state = torch.cat([
-            torch.clamp(prog_best.unsqueeze(0), -5.0, 5.0),
-            torch.clamp(prog_median.unsqueeze(0), -5.0, 5.0),
-            torch.clamp(div_t.unsqueeze(0) / 100.0, 0.0, 5.0),
-            torch.clamp(div_change.unsqueeze(0), -1.0, 1.0),
-            stag_ratio.unsqueeze(0),
-            skewness.unsqueeze(0) / 5.0,
-            entropy.unsqueeze(0),
-            torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),  # 新增：聚类分离度
-            roi_tensor,
-            last_action[0].unsqueeze(0),
-            last_action[1].unsqueeze(0),
-            last_action[3].unsqueeze(0),
-            last_action[4].unsqueeze(0),
-        ], dim=0)
-
-        return state.unsqueeze(0)  # [1, 13]
-
-==================================================
-
-// [MODULE] File: rlec\features\stage_reward.py
-----------------------------------------
-import torch
-
-
-class StageRewardCalculator:
-    def __init__(self, w_best=2.0, w_median=0.5, w_div=0.2, w_rescue=1.0, w_cost=0.5, w_collapse=1.0):
-        self.w_best = w_best
-        self.w_median = w_median
-        self.w_div = w_div
-        self.w_rescue = w_rescue
-        self.w_cost = w_cost
-        self.w_collapse = w_collapse  # 新增：塌缩惩罚权重
-
-    def calculate(self,
-                  fit_start: torch.Tensor, fit_end: torch.Tensor,
-                  div_start: float, div_end: float, target_div: float, initial_div: float,
-                  stagnation_start: torch.Tensor, stag_ratio: float,
-                  action: torch.Tensor) -> float:
-
-        # 1. 最优值收益
-        best_start, best_end = torch.min(fit_start), torch.min(fit_end)
-        r_best = torch.log1p(torch.relu(best_start - best_end)) / (torch.log1p(torch.abs(best_start)) + 1e-8)
-
-        # 2. 中位数收益
-        median_start, median_end = torch.median(fit_start), torch.median(fit_end)
-        r_median = torch.log1p(torch.relu(median_start - median_end)) / (torch.log1p(torch.abs(median_start)) + 1e-8)
-
-        # 3. 多样性控制收益 (向目标靠拢)
-        err_start = abs(div_start - target_div)
-        err_end = abs(div_end - target_div)
-        r_div = (err_start - err_end) / (initial_div + 1e-8)
-
-        # 4. 停滞脱困收益
-        is_stagnant_start = (stagnation_start >= 10)
-        num_stagnant = is_stagnant_start.sum().item()
-        if num_stagnant > 0:
-            rel_improve = (fit_start - fit_end) / (torch.abs(fit_start) + 1e-8)
-            r_rescue = (is_stagnant_start & (rel_improve > 1e-4)).sum().item() / num_stagnant
-        else:
-            r_rescue = 0.0
-
-        # 5. 干预成本
-        c_intervene = (action[3].item() + action[4].item()) / 2.0
-
-        # 6. 【必须改 4 应用】：过早塌缩惩罚 (Collapse Penalty)
-        # 如果多样性跌破初始值的 1% (极度塌缩)，且全场有大量粒子处于停滞期，严惩！
-        tau_div = initial_div * 0.01
-        collapse_penalty = 0.0
-        if div_end < tau_div and stag_ratio > 0.5:
-            collapse_penalty = (tau_div - div_end) / tau_div * stag_ratio
-
-        total_reward = (
-                self.w_best * r_best.item() +
-                self.w_median * r_median.item() +
-                self.w_div * r_div +
-                self.w_rescue * r_rescue -
-                self.w_cost * c_intervene -
-                self.w_collapse * collapse_penalty
-        )
-
-        roi = total_reward / (c_intervene + 1e-4)
-        return total_reward, roi
-
-==================================================
-
-// [MODULE] File: rlec\rl\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\rl\networks.py
-----------------------------------------
-import torch
-import torch.nn as nn
-from torch.distributions import Normal
-
-class ActorMLP(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
-        super().__init__()
-        # 强力 MLP 提取 13 维宏观特征
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-        # 独立的可训练对数标准差（控制探索方差）
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
-
-    def forward(self, state):
-        mean = self.net(state)
-        std = self.log_std.exp().expand_as(mean)
-        return Normal(mean, std)
-
-class CriticMLP(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, state):
-        return self.net(state)
-
-==================================================
-
-// [MODULE] File: rlec\rl\ppo_lstm.py
-----------------------------------------
-import torch
-import torch.nn as nn
-import numpy as np
-from .networks import ActorMLP, CriticMLP
-from .rollout_buffer import RolloutBuffer
-
-
-class PPO:
-    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
-                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.2,
-                 entropy_coef=0.01, k_epochs=4):
-        self.device = device
-        self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.k_epochs = k_epochs
-
-        self.actor = ActorMLP(state_dim, action_dim).to(device)
-        self.critic = CriticMLP(state_dim).to(device)
-
-        self.optimizer = torch.optim.Adam([
-            {'params': self.actor.parameters(), 'lr': lr_actor},
-            {'params': self.critic.parameters(), 'lr': lr_critic}
-        ])
-        self.buffer = RolloutBuffer(device)
-
-    def select_action(self, state: torch.Tensor, deterministic=False):
-        with torch.no_grad():
-            dist = self.actor(state)
-            value = self.critic(state)
-            action = dist.mean if deterministic else dist.sample()
-            log_prob = dist.log_prob(action).sum(dim=-1)
-
-            # 【建议修 4】：限制高斯采样的极端值，防止 sigmoid 梯度消失
-            raw_action = torch.clamp(action, -4.0, 4.0)
-            intent_action = torch.sigmoid(raw_action)
-
-        return (action.cpu().numpy(), intent_action.cpu().numpy(),
-                log_prob.item(), value.item())
-
-    def update(self):
-        if len(self.buffer.states) == 0: return {}
-
-        states = torch.stack(self.buffer.states).to(self.device)
-        actions = torch.stack(self.buffer.actions).to(self.device)
-        old_log_probs = torch.tensor(self.buffer.log_probs, device=self.device)
-
-        with torch.no_grad():
-            next_value = self.critic(states[-1:]).item()
-
-        returns, advantages = self.buffer.compute_gae(next_value, self.gamma)
-        actor_loss_list, critic_loss_list = [], []
-
-        for _ in range(self.k_epochs):
-            dist = self.actor(states)
-            values = self.critic(states).squeeze(-1)
-            log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-
-            ratios = torch.exp(log_probs - old_log_probs)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
-            critic_loss = nn.MSELoss()(values, returns)
-
-            loss = actor_loss + 0.5 * critic_loss
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-            self.optimizer.step()
-
-            actor_loss_list.append(actor_loss.item())
-            critic_loss_list.append(critic_loss.item())
-
-        self.buffer.clear()
-        return {"actor_loss": np.mean(actor_loss_list), "critic_loss": np.mean(critic_loss_list)}
-
-==================================================
-
-// [MODULE] File: rlec\rl\rollout_buffer.py
-----------------------------------------
-import torch
-
-class RolloutBuffer:
-    """PPO 专用的 On-policy 轨迹缓冲池"""
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.clear()
-
-    def clear(self):
-        self.states, self.actions, self.rewards = [], [], []
-        self.values, self.log_probs, self.dones = [], [], []
-
-    def add(self, state, action, reward, value, log_prob, done):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-        self.dones.append(done)
-
-    def compute_gae(self, next_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
-        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
-        values = torch.tensor(self.values + [next_value], dtype=torch.float32, device=self.device)
-        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
-
-        advantages = torch.zeros(len(rewards), dtype=torch.float32, device=self.device)
-        last_gae = 0.0
-
-        for t in reversed(range(len(rewards))):
-            mask = 1.0 - dones[t]
-            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
-            advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
-
-        returns = advantages + values[:-1]
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return returns, advantages
-
-==================================================
-
-// [MODULE] File: rlec\utils\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\utils\population_metrics.py
-----------------------------------------
-import torch
-
-
-def compute_diversity(pop: torch.Tensor) -> torch.Tensor:
-    return torch.std(pop, dim=0).mean()
-
-
-def compute_fitness_skewness(fit: torch.Tensor) -> torch.Tensor:
-    mean = fit.mean()
-    std = fit.std() + 1e-8
-    skewness = torch.mean(((fit - mean) / std) ** 3)
-    return torch.clamp(skewness, -5.0, 5.0)
-
-
-def compute_rank_entropy(fit: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    norm_fit = (fit - fit.mean()) / (fit.std() + 1e-8)
-    probs = torch.softmax(-norm_fit / temperature, dim=0)
-    entropy = -(probs * torch.log(probs + 1e-8)).sum()
-    max_entropy = torch.log(torch.tensor(float(fit.shape[0]), device=fit.device))
-    return entropy / max_entropy
-
-
-def compute_stagnation_ratio(stagnation: torch.Tensor, threshold: int = 10) -> torch.Tensor:
-    stagnant_count = (stagnation >= threshold).sum().float()
-    return stagnant_count / stagnation.shape[0]
-
-
-# 【必须改 4】：新增聚类分离度特征，识别种群是否塌缩为单峰
-def compute_elite_separation(pop: torch.Tensor, fit: torch.Tensor, q: float = 0.1) -> torch.Tensor:
-    """计算精英簇与其他个体之间的分离度 (分离度越高，说明盆地越多/结构越清晰)"""
-    N = pop.shape[0]
-    k = max(1, int(N * q))
-
-    _, indices = torch.sort(fit)
-    elite_idx = indices[:k]
-    non_elite_idx = indices[k:]
-
-    elite_pop = pop[elite_idx]
-    non_elite_pop = pop[non_elite_idx]
-
-    # 找到精英簇的中心点
-    elite_center = elite_pop.mean(dim=0)
-
-    # 精英簇内部的紧凑度
-    elite_spread = torch.norm(elite_pop - elite_center, dim=1).mean()
-    # 大众个体离精英中心的平均距离
-    separation = torch.norm(non_elite_pop - elite_center, dim=1).mean()
-
-    # 比例越大，说明种群不仅有精英，还有大量个体在远方探索 (多模态结构)
-    return separation / (elite_spread + 1e-8)
 
 ==================================================
 

@@ -26,17 +26,23 @@ class PPO:
 
     def select_action(self, state: torch.Tensor, deterministic=False):
         with torch.no_grad():
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+
             dist = self.actor(state)
             value = self.critic(state)
             action = dist.mean if deterministic else dist.sample()
             log_prob = dist.log_prob(action).sum(dim=-1)
 
-            # 【建议修 4】：限制高斯采样的极端值，防止 sigmoid 梯度消失
             raw_action = torch.clamp(action, -4.0, 4.0)
             intent_action = torch.sigmoid(raw_action)
 
-        return (action.cpu().numpy(), intent_action.cpu().numpy(),
-                log_prob.item(), value.item())
+        return (
+            action.squeeze(0).cpu().numpy(),
+            intent_action.squeeze(0).cpu().numpy(),
+            log_prob.squeeze(0).item(),
+            value.squeeze(0).item()
+        )
 
     def update(self):
         if len(self.buffer.states) == 0: return {}
@@ -53,7 +59,6 @@ class PPO:
 
         for _ in range(self.k_epochs):
             dist = self.actor(states)
-            values = self.critic(states).squeeze(-1)
             log_probs = dist.log_prob(actions).sum(dim=-1)
             entropy = dist.entropy().sum(dim=-1).mean()
 
@@ -62,6 +67,8 @@ class PPO:
             surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
 
             actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+            values = self.critic(states).reshape(-1)
+            returns = returns.reshape(-1)
             critic_loss = nn.MSELoss()(values, returns)
 
             loss = actor_loss + 0.5 * critic_loss

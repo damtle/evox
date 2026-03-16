@@ -1,6 +1,6 @@
 from typing import Optional
 import torch
-from evox.algorithms import CoDE
+from evox.algorithms import CoDE, DE
 from rlec.algorithms.rlec_wrapper import RLECWrapper
 
 
@@ -17,7 +17,7 @@ def make_rlec_code(
     快速创建一个被 RLEC 控制器包裹的 CoDE 算法实例
     """
     device = torch.get_default_device() if device is None else device
-    base_code = CoDE(pop_size, lb, ub, device=device)
+    base_code = DE(pop_size, lb, ub, device=device)
 
     if not enable_rl:
         return base_code
