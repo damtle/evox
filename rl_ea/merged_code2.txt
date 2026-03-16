@@ -281,51 +281,88 @@ class TD3Agent:
         r = batch['rewards'].unsqueeze(-1)
         s2 = batch['next_states']
         d = batch['dones'].unsqueeze(-1)
+        sources = batch['sources']
 
-        with torch.no_grad():
-            noise = (torch.randn_like(a) * self.cfg.policy_noise * self.max_action).clamp(
-                -self.cfg.noise_clip * self.max_action,
-                self.cfg.noise_clip * self.max_action,
-            )
-            next_a = self.actor_target(s2) + noise
-            next_a = torch.max(torch.min(next_a, self.max_action), -self.max_action)
-            target_q1, target_q2 = self.critic_target(s2, next_a)
-            target_q = torch.min(target_q1, target_q2)
-            y = r + (1.0 - d) * self.cfg.gamma * target_q
+        # 区分数据来源
+        rl_mask = (sources == 1)
+        ea_mask = (sources == 0)
 
-            # 【修复 6-1：目标 Q 值截断】防止 Q 值在自举过程中滚雪球式爆炸
-            y = torch.clamp(y, -10.0, 10.0)
+        td_error = torch.zeros(s.shape[0], device=self.device)
+        critic_loss_val = 0.0
 
-        q1, q2 = self.critic(s, a)
-        critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        # 【修复 6-2：Critic 梯度裁剪】把 Critic 的梯度长度强行限制在 1.0 以内
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_opt.step()
+        # =====================================================================
+        # 1. Critic Update (只用 RL 数据，彻底斩断外推误差！)
+        # =====================================================================
+        if rl_mask.any():
+            s_rl, a_rl, r_rl, s2_rl, d_rl = s[rl_mask], a[rl_mask], r[rl_mask], s2[rl_mask], d[rl_mask]
 
-        td_error = (q1.detach() - y).abs().squeeze(-1)
+            with torch.no_grad():
+                noise = (torch.randn_like(a_rl) * self.cfg.policy_noise * self.max_action).clamp(
+                    -self.cfg.noise_clip * self.max_action,
+                    self.cfg.noise_clip * self.max_action,
+                )
+                next_a = self.actor_target(s2_rl) + noise
+                next_a = torch.max(torch.min(next_a, self.max_action), -self.max_action)
+                target_q1, target_q2 = self.critic_target(s2_rl, next_a)
+                target_q = torch.min(target_q1, target_q2)
+                y = r_rl + (1.0 - d_rl) * self.cfg.gamma * target_q
+                y = torch.clamp(y, -10.0, 10.0)
+
+            q1, q2 = self.critic(s_rl, a_rl)
+            critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+            self.critic_opt.step()
+
+            td_error[rl_mask] = (q1.detach() - y).abs().squeeze(-1)
+            critic_loss_val = float(critic_loss.item())
+
+            # 记录 Q 的绝对均值，用于 Actor BC Loss 的自适应权重
+            q_abs_mean = q1.detach().abs().mean().item()
+        else:
+            q_abs_mean = 1.0
+
         info = {
-            'critic_loss': float(critic_loss.item()),
+            'critic_loss': critic_loss_val,
             'td_error': td_error,
         }
 
+        # =====================================================================
+        # 2. Actor Update (混合数据：RL 数据优化 Q，EA 数据做 BC 正则化)
+        # =====================================================================
         self.total_updates += 1
         if self.total_updates % self.cfg.policy_freq == 0:
-            actor_loss = -self.critic.q1_only(s, self.actor(s)).mean()
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-            self.actor_opt.step()
+            actor_loss = torch.tensor(0.0, device=self.device)
+
+            # 2.1 对于 RL 数据：最大化 Q 值 (寻找超越 EA 的方向)
+            if rl_mask.any():
+                actor_loss_rl = -self.critic.q1_only(s[rl_mask], self.actor(s[rl_mask])).mean()
+                actor_loss = actor_loss + actor_loss_rl
+
+            # 2.2 对于 EA 数据：Behavior Cloning (保证动作不偏离 EA 探索的底层逻辑)
+            if ea_mask.any():
+                pi_ea = self.actor(s[ea_mask])
+                bc_loss = F.mse_loss(pi_ea, a[ea_mask])
+
+                # TD3+BC 自适应衰减机制：Q 值越大（网络越自信），BC 的权重 \lambda 就越小，完成退火
+                alpha = 2.5
+                lmbda = alpha / (q_abs_mean + 1e-5)
+
+                actor_loss = actor_loss + lmbda * bc_loss
+
+            if actor_loss.requires_grad:
+                self.actor_opt.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                self.actor_opt.step()
 
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
-            # info['actor_loss'] = float(actor_loss.item())
+            self.last_actor_loss = float(actor_loss.item())
 
-            self.last_actor_loss = float(actor_loss.item())  # 【新增】记录最新 loss
-
-        info['actor_loss'] = self.last_actor_loss  # 【新增】保证每次字典里都有这行
-
+        info['actor_loss'] = self.last_actor_loss
         return info
 
     def _soft_update(self, net, target_net):
@@ -502,6 +539,8 @@ class PrioritizedReplayBuffer:
             'next_states': torch.stack([t.next_state for t in batch]).to(self.device),
             'dones': torch.stack([t.done for t in batch]).to(self.device),
             'future_improvements': torch.stack([t.future_improvement for t in batch]).to(self.device),
+            # 【新增】：把 source (0为EA, 1为RL) 传给 agent 做区分训练
+            'sources': torch.as_tensor([t.source for t in batch], device=self.device, dtype=torch.long),
             'indices': torch.as_tensor(indices, device=self.device, dtype=torch.long),
         }
 
@@ -570,7 +609,7 @@ def compute_novelty_reward(candidate_pop: torch.Tensor, pop: torch.Tensor) -> to
 from __future__ import annotations
 
 import torch
-from evox.algorithms import PSO, SaDE
+from evox.algorithms import PSO, SaDE, CoDE
 
 from rl_ea.rl.agent import TD3Agent, TD3Config
 from rl_ea.replay.buffer import PrioritizedReplayBuffer
@@ -596,7 +635,7 @@ def make_rl_pso(
 ):
     device = torch.get_default_device() if device is None else device
     # base = PSO(pop_size=pop_size, lb=lb, ub=ub, w=w, phi_p=phi_p, phi_g=phi_g, device=device)
-    base = SaDE(pop_size, lb, ub, device=device)
+    base = CoDE(pop_size, lb, ub, device=device)
     if not enable_rl:
         return base
 
@@ -816,15 +855,22 @@ class RLEnhancedAlgorithm(Algorithm):
             step_scale = (raw_action[:, self.dim:self.dim + 1] + 1.0) / 2.0
             # 3. 探索门控 [0, 1] (0: 纯局部修调 pop_std, 1: 纯全局大跳跃 ub-lb)
             explore_gate = (raw_action[:, self.dim + 1:self.dim + 2] + 1.0) / 2.0
-            
-            # 【修复问题 1】：加入 10% 的强制全局探索概率，防止网络退化为纯局部搜索
-            if torch.rand(1).item() < 0.1:
+
+            # 强制试探：5% 概率做极限大跳跃，5% 概率做种群内部大跨越
+            rand_val = torch.rand(1).item()
+            if rand_val < 0.05:
                 explore_gate = torch.ones_like(explore_gate)
+            elif rand_val < 0.10:
+                explore_gate = torch.zeros_like(explore_gate)
 
-            global_scale = (self.ub - self.lb)
+            # =========================================================================
+            # 【稳健 Patch 1】：温和放大物理尺度
+            # 局部：放大到 1.25 倍 pop_std，给一点探索空间但不破坏 Critic 的认知
+            # 全局：设为搜索空间的 10%，既能跳出当前 basin，又不算瞎跳
+            # =========================================================================
+            macro_scale = (self.ub - self.lb) * 0.1
+            effective_scale = (1.0 - explore_gate) * (pop_std * 1.25) + explore_gate * macro_scale
 
-            # 动态混合有效尺度
-            effective_scale = (1.0 - explore_gate) * pop_std + explore_gate * global_scale
             dx = direction * effective_scale * step_scale
 
             candidate_pop = pop[rl_indices] + dx
@@ -851,7 +897,7 @@ class RLEnhancedAlgorithm(Algorithm):
             escape_bonus = 0.5 * (is_stagnant.float() * improved_rl.float())
 
             # 最终的战略级奖励：Fitness (主目标) + Novelty (鼓励走新路) + Escape (鼓励拯救烂摊子)
-            reward = fit_reward + 0.05 * novelty_reward + escape_bonus
+            reward = fit_reward + 0.08 * novelty_reward + escape_bonus
 
             done = torch.zeros_like(reward)
             future_improvement = torch.clamp(fit[rl_indices] - candidate_fit, min=0.0)
@@ -876,7 +922,16 @@ class RLEnhancedAlgorithm(Algorithm):
             # 核心思想: 无论是 PSO 还是 DE，RL 只在个体的当前位置提供“局部梯度下降”
             # 绝不跨越生态位替换其他粒子，从而最大程度保护 EA 的种群多样性和探索能力
             # =========================================================================
-            better = candidate_fit < fit[rl_indices]
+            # 【稳健 Patch 3】：坚决拒绝毫无意义的微调，逼迫 RL 找真正有价值的解
+            rel_improvement = (fit[rl_indices] - candidate_fit) / (torch.abs(fit[rl_indices]) + 1e-8)
+
+            # 条件1：创造了新的全局最优 (无条件接受)
+            is_new_global = candidate_fit < self.global_best_fit
+            # 条件2：获得了实质性的局部提升 (大于万分之五 5e-4，门槛温和但足以拦住刷分)
+            is_significant = rel_improvement > 5e-4
+
+            # 必须严格更好，且满足实质性提升或全局最优才允许替换！
+            better = (candidate_fit < fit[rl_indices]) & (is_new_global | is_significant)
 
             num_success = better.sum().item()
 
@@ -931,66 +986,55 @@ class RLEnhancedAlgorithm(Algorithm):
         if hasattr(self.base, 'best_index'):  # 兼容 SaDE
             self.base.best_index = current_best_idx
 
-        # # =========================================================================
-        # # 【核心修改 D】：精准逆向映射 EA 经验到新的复合动作空间
-        # # =========================================================================
-        # ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
-        # ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
-        # ea_next_states = states
-        # 构建一个安全的 prev_fit
-        # prev_fit_safe_for_prev = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
-        # prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit_safe_for_prev,
-        #                                        prev_fit_safe_for_prev, pop_mean, pop_std, self.stagnation)
-        # for i in range(min(self.pop_size, n_rl)):
-        #     idx = int(i)
-        #     dx_ea = pop[idx] - self.prev_pop[idx]
-        #
-        #     # 将 EA 的自然步长逆推为网络输出格式：
-        #     # 假设 explore_gate = 0.0 -> 映射到网络输出为 -1.0
-        #     # 那么 effective_scale = pop_std
-        #     rel_dx = dx_ea / (pop_std + 1e-6)
-        #
-        #     # 提取最大相对尺度作为 step_scale_ea (范围 0~1)
-        #     step_scale_ea = torch.clamp(torch.max(torch.abs(rel_dx)), max=1.0)
-        #
-        #     if step_scale_ea > 1e-6:
-        #         direction_ea = torch.clamp(rel_dx / step_scale_ea, -1.0, 1.0)
-        #     else:
-        #         direction_ea = torch.zeros_like(dx_ea)
-        #
-        #     # 将 step_scale_ea (0~1) 映射回网络的原始范围 (-1~1)
-        #     raw_step_scale = step_scale_ea * 2.0 - 1.0
-        #     raw_explore_gate = torch.tensor([-1.0], device=self.device)
-        #
-        #     ea_raw_action = torch.cat([
-        #         direction_ea,
-        #         raw_step_scale.unsqueeze(0),
-        #         raw_explore_gate
-        #     ])
-        #
-        #     t = Transition(
-        #         state=prev_states[idx].detach().cpu(),
-        #         action=ea_raw_action.detach().cpu(),
-        #         reward=ea_reward[idx].detach().cpu(),
-        #         next_state=ea_next_states[idx].detach().cpu(),
-        #         done=torch.tensor(0.0, device='cpu'),
-        #         future_improvement=ea_future[idx].detach().cpu(),
-        #         td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
-        #         source=0,
-        #         traj_id=traj_id,
-        #         step_id=step_id,
-        #     )
-        #     self.replay.add(t)
+        # 【核心修改 D】：收集 EA 经验并逆向映射，专门留给 Actor 做 Behavior Cloning！
+        # =========================================================================
+        ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
+        ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
+        ea_next_states = states
+
+        prev_fit_safe_for_prev = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
+        prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit_safe_for_prev,
+                                               prev_fit_safe_for_prev, pop_mean, pop_std, self.stagnation)
+
+        for i in range(min(self.pop_size, n_rl)):
+            idx = int(i)
+            dx_ea = pop[idx] - self.prev_pop[idx]
+
+            rel_dx = dx_ea / (pop_std + 1e-6)
+            step_scale_ea = torch.clamp(torch.max(torch.abs(rel_dx)), max=1.0)
+
+            if step_scale_ea > 1e-6:
+                direction_ea = torch.clamp(rel_dx / step_scale_ea, -1.0, 1.0)
+            else:
+                direction_ea = torch.zeros_like(dx_ea)
+
+            raw_step_scale = step_scale_ea * 2.0 - 1.0
+            raw_explore_gate = torch.tensor([-1.0], device=self.device)
+
+            ea_raw_action = torch.cat([direction_ea, raw_step_scale.unsqueeze(0), raw_explore_gate])
+
+            t = Transition(
+                state=prev_states[idx].detach().cpu(),
+                action=ea_raw_action.detach().cpu(),
+                reward=ea_reward[idx].detach().cpu(),
+                next_state=ea_next_states[idx].detach().cpu(),
+                done=torch.tensor(0.0, device='cpu'),
+                future_improvement=ea_future[idx].detach().cpu(),
+                td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
+                source=0,  # ★ 核心：0 代表这是 EA 数据，Critic 绝不碰它！
+                traj_id=traj_id,
+                step_id=step_id,
+            )
+            self.replay.add(t)
 
         # =========================================================================
         # 7) Train RL from replay
-        # ★ 如果 RL 失去作用（成功率低下且种群停滞），立刻停止训练，阻断 Extrapolation Error！
         # =========================================================================
         info = {}
         if len(self.replay) >= self.train_after and is_warmup_over and is_rl_useful:
             for _ in range(self.train_steps_per_gen):
-                # 【修复】：去掉 rl_ratio 参数，只使用 RL 经验
-                batch = self.replay.sample(self.batch_size)
+                # 【修改】：恢复 rl_ratio=0.5，让 Batch 里有一半的 EA 老师教导 Actor
+                batch = self.replay.sample(self.batch_size, rl_ratio=0.5)
                 info = self.rl_agent.update(batch)
                 self.replay.update_td_priorities(batch['indices'].tolist(), info['td_error'])
 

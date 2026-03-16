@@ -56,6 +56,20 @@ def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int
         if hasattr(problem, attr) and getattr(problem, attr) is not None:
             setattr(problem, attr, getattr(problem, attr).to(device))
 
+    optimum_values = {
+        1: 300, 2: 400, 3: 600, 4: 800, 5: 900,
+        6: 1800, 7: 2000, 8: 2200, 9: 2300, 10: 2400, 11: 2600, 12: 2700
+    }
+    f_star = optimum_values.get(func_id, 0.0)
+
+    original_evaluate = problem.evaluate
+
+    def shifted_evaluate(state: torch.Tensor) -> torch.Tensor:
+        # 直接减去极小值，让最优值变成 0
+        return original_evaluate(state) - f_star
+
+    problem.evaluate = shifted_evaluate
+
     monitor = EvalMonitor()
     workflow = StdWorkflow(algorithm, problem, monitor)
 

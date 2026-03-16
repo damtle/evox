@@ -55,6 +55,15 @@ class RLEnhancedAlgorithm(Algorithm):
         # history required to form state features
         self.prev_pop = Mutable(base_algo.pop.clone())
         self.prev_fit = Mutable(torch.full_like(base_algo.fit, torch.inf))
+
+        self.prev_prev_pop = Mutable(base_algo.pop.clone())
+        self.prev_prev_fit = Mutable(torch.full_like(base_algo.fit, torch.inf))
+
+        # 【修复问题 1】：新增 prev_prev 记忆，用于构建 EA 的真实动态状态
+        self.prev_pop_mean = Mutable(torch.zeros(self.dim, device=self.device))
+        self.prev_pop_std = Mutable(torch.ones(self.dim, device=self.device))
+        self.prev_stagnation = Mutable(torch.zeros(self.pop_size, device=self.device))
+
         self.traj_counter = Mutable(torch.tensor(0, device=self.device))
         self.step_counter = Mutable(torch.tensor(0, device=self.device))
 
@@ -103,6 +112,14 @@ class RLEnhancedAlgorithm(Algorithm):
         self.base.init_step()
         self.prev_pop = self.base.pop.clone()
         self.prev_fit = self.base.fit.clone()
+
+        self.prev_prev_pop = self.base.pop.clone()
+        self.prev_prev_fit = self.base.fit.clone()
+
+        # 【修复问题 1】：初始化时同步
+        self.prev_pop_mean = torch.mean(self.base.pop, dim=0)
+        self.prev_pop_std = torch.std(self.base.pop, dim=0)
+        self.prev_stagnation = torch.zeros(self.pop_size, device=self.device)
 
         # 【核心修复 2】：初始化时，从种群中找出当前的最优值存入 Wrapper
         best_val, best_idx = torch.min(self.base.fit, dim=0)
@@ -309,66 +326,85 @@ class RLEnhancedAlgorithm(Algorithm):
         if hasattr(self.base, 'best_index'):  # 兼容 SaDE
             self.base.best_index = current_best_idx
 
-        # # =========================================================================
-        # # 【核心修改 D】：精准逆向映射 EA 经验到新的复合动作空间
-        # # =========================================================================
-        # ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
-        # ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
-        # ea_next_states = states
-        # 构建一个安全的 prev_fit
-        # prev_fit_safe_for_prev = torch.where(torch.isfinite(self.prev_fit), self.prev_fit, fit)
-        # prev_states = self.state_builder.build(self.prev_pop, self.prev_pop, prev_fit_safe_for_prev,
-        #                                        prev_fit_safe_for_prev, pop_mean, pop_std, self.stagnation)
-        # for i in range(min(self.pop_size, n_rl)):
-        #     idx = int(i)
-        #     dx_ea = pop[idx] - self.prev_pop[idx]
-        #
-        #     # 将 EA 的自然步长逆推为网络输出格式：
-        #     # 假设 explore_gate = 0.0 -> 映射到网络输出为 -1.0
-        #     # 那么 effective_scale = pop_std
-        #     rel_dx = dx_ea / (pop_std + 1e-6)
-        #
-        #     # 提取最大相对尺度作为 step_scale_ea (范围 0~1)
-        #     step_scale_ea = torch.clamp(torch.max(torch.abs(rel_dx)), max=1.0)
-        #
-        #     if step_scale_ea > 1e-6:
-        #         direction_ea = torch.clamp(rel_dx / step_scale_ea, -1.0, 1.0)
-        #     else:
-        #         direction_ea = torch.zeros_like(dx_ea)
-        #
-        #     # 将 step_scale_ea (0~1) 映射回网络的原始范围 (-1~1)
-        #     raw_step_scale = step_scale_ea * 2.0 - 1.0
-        #     raw_explore_gate = torch.tensor([-1.0], device=self.device)
-        #
-        #     ea_raw_action = torch.cat([
-        #         direction_ea,
-        #         raw_step_scale.unsqueeze(0),
-        #         raw_explore_gate
-        #     ])
-        #
-        #     t = Transition(
-        #         state=prev_states[idx].detach().cpu(),
-        #         action=ea_raw_action.detach().cpu(),
-        #         reward=ea_reward[idx].detach().cpu(),
-        #         next_state=ea_next_states[idx].detach().cpu(),
-        #         done=torch.tensor(0.0, device='cpu'),
-        #         future_improvement=ea_future[idx].detach().cpu(),
-        #         td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
-        #         source=0,
-        #         traj_id=traj_id,
-        #         step_id=step_id,
-        #     )
-        #     self.replay.add(t)
+        # =========================================================================
+        # 【核心修改 D】：收集优质 EA 经验，用于 Behavior Cloning
+        # =========================================================================
+        ea_reward = torch.clamp(self.prev_fit - fit, min=-1.0, max=1.0)
+        ea_future = torch.clamp(self.prev_fit - fit, min=0.0)
+        ea_next_states = states
+
+        # 【严谨补丁 2】：使用 prev_pop_mean 等历史变量，构建当时 100% 真实的历史状态
+        prev_prev_fit_safe = torch.where(torch.isfinite(self.prev_prev_fit), self.prev_prev_fit, self.prev_fit)
+        ea_states = self.state_builder.build(self.prev_pop, self.prev_prev_pop, self.prev_fit,
+                                             prev_prev_fit_safe, self.prev_pop_mean, self.prev_pop_std,
+                                             self.prev_stagnation)
+
+        # 严格筛选优质 EA 动作
+        ea_improved = fit < self.prev_fit
+        ea_rel_improve = (self.prev_fit - fit) / (torch.abs(self.prev_fit) + 1e-8)
+        good_ea_mask = ea_improved & (ea_rel_improve > 1e-4)
+        good_ea_indices = torch.where(good_ea_mask)[0]
+
+        if len(good_ea_indices) > n_rl:
+            good_ea_indices = good_ea_indices[torch.randperm(len(good_ea_indices))[:n_rl]]
+
+        for idx in good_ea_indices:
+            idx = int(idx)
+            dx_ea = pop[idx] - self.prev_pop[idx]
+
+            # 【严谨补丁 3】：改用整体尺度 (torch.norm 和 torch.mean) 计算 explore_gate，防止逐维除以极小值导致 NaN
+            local_scale = torch.mean(self.prev_pop_std) + 1e-6
+            global_scale = torch.mean((self.ub - self.lb) * 0.1) + 1e-6
+
+            ratio_local = torch.norm(dx_ea) / local_scale
+            ratio_global = torch.norm(dx_ea) / global_scale
+
+            explore_gate_ea = ratio_global / (ratio_local + ratio_global + 1e-6)
+            raw_explore_gate = torch.tensor([explore_gate_ea * 2.0 - 1.0], device=self.device)
+
+            rel_dx = dx_ea / (self.prev_pop_std + 1e-6)
+            step_scale_ea = torch.clamp(torch.max(torch.abs(rel_dx)), max=1.0)
+
+            if step_scale_ea > 1e-6:
+                direction_ea = torch.clamp(rel_dx / step_scale_ea, -1.0, 1.0)
+            else:
+                direction_ea = torch.zeros_like(dx_ea)
+
+            raw_step_scale = step_scale_ea * 2.0 - 1.0
+            ea_raw_action = torch.cat([direction_ea, raw_step_scale.unsqueeze(0), raw_explore_gate])
+
+            t = Transition(
+                state=ea_states[idx].detach().cpu(),
+                action=ea_raw_action.detach().cpu(),
+                reward=ea_reward[idx].detach().cpu(),
+                next_state=ea_next_states[idx].detach().cpu(),
+                done=torch.tensor(0.0, device='cpu'),
+                future_improvement=ea_future[idx].detach().cpu(),
+                td_priority=float(abs(ea_reward[idx].item()) + 1e-6),
+                source=0,
+                traj_id=traj_id,
+                step_id=step_id,
+            )
+            self.replay.add(t)
 
         # =========================================================================
         # 7) Train RL from replay
-        # ★ 如果 RL 失去作用（成功率低下且种群停滞），立刻停止训练，阻断 Extrapolation Error！
         # =========================================================================
         info = {}
         if len(self.replay) >= self.train_after and is_warmup_over and is_rl_useful:
+            current_step_float = float(self.step_counter.item())
+
+            # 【严谨补丁 4】：不但控制采样比例，还要把随时间递减的权重因子传给 Agent
+            step_decay = max(0.1, 1.0 - current_step_float / 1000.0)
+            ea_ratio = max(0.1, 0.5 * step_decay)
+            current_rl_ratio = 1.0 - ea_ratio
+
             for _ in range(self.train_steps_per_gen):
-                # 【修复】：去掉 rl_ratio 参数，只使用 RL 经验
-                batch = self.replay.sample(self.batch_size)
+                batch = self.replay.sample(self.batch_size, rl_ratio=current_rl_ratio)
+
+                # 将退火权重硬塞入 batch 字典中，传给 Agent 的 BC Loss
+                batch['bc_decay'] = torch.tensor(step_decay, device=self.device)
+
                 info = self.rl_agent.update(batch)
                 self.replay.update_td_priorities(batch['indices'].tolist(), info['td_error'])
 
@@ -389,8 +425,16 @@ class RLEnhancedAlgorithm(Algorithm):
             self.log_rl_total = 0
             self.log_rl_improve = 0.0
 
+        self.prev_prev_pop = self.prev_pop.clone()
+        self.prev_prev_fit = self.prev_fit.clone()
+
         self.prev_pop = self.base.pop.clone()
         self.prev_fit = self.base.fit.clone()
-        self.step_counter = self.step_counter + 1
 
+        # 【严谨补丁 1 结尾】：滚动更新种群统计态势
+        self.prev_pop_mean = pop_mean.clone()
+        self.prev_pop_std = pop_std.clone()
+        self.prev_stagnation = self.stagnation.clone()
+
+        self.step_counter = self.step_counter + 1
         self.traj_counter = self.traj_counter + 1

@@ -103,6 +103,8 @@ class PrioritizedReplayBuffer:
             'next_states': torch.stack([t.next_state for t in batch]).to(self.device),
             'dones': torch.stack([t.done for t in batch]).to(self.device),
             'future_improvements': torch.stack([t.future_improvement for t in batch]).to(self.device),
+            # 【新增】：把 source (0为EA, 1为RL) 传给 agent 做区分训练
+            'sources': torch.as_tensor([t.source for t in batch], device=self.device, dtype=torch.long),
             'indices': torch.as_tensor(indices, device=self.device, dtype=torch.long),
         }
 

@@ -52,51 +52,91 @@ class TD3Agent:
         r = batch['rewards'].unsqueeze(-1)
         s2 = batch['next_states']
         d = batch['dones'].unsqueeze(-1)
+        sources = batch['sources']
 
-        with torch.no_grad():
-            noise = (torch.randn_like(a) * self.cfg.policy_noise * self.max_action).clamp(
-                -self.cfg.noise_clip * self.max_action,
-                self.cfg.noise_clip * self.max_action,
-            )
-            next_a = self.actor_target(s2) + noise
-            next_a = torch.max(torch.min(next_a, self.max_action), -self.max_action)
-            target_q1, target_q2 = self.critic_target(s2, next_a)
-            target_q = torch.min(target_q1, target_q2)
-            y = r + (1.0 - d) * self.cfg.gamma * target_q
+        # 区分数据来源
+        rl_mask = (sources == 1)
+        ea_mask = (sources == 0)
 
-            # 【修复 6-1：目标 Q 值截断】防止 Q 值在自举过程中滚雪球式爆炸
-            y = torch.clamp(y, -10.0, 10.0)
+        td_error = torch.zeros(s.shape[0], device=self.device)
+        critic_loss_val = 0.0
 
-        q1, q2 = self.critic(s, a)
-        critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        # 【修复 6-2：Critic 梯度裁剪】把 Critic 的梯度长度强行限制在 1.0 以内
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_opt.step()
+        # =====================================================================
+        # 1. Critic Update (只用 RL 数据，彻底斩断外推误差！)
+        # =====================================================================
+        if rl_mask.any():
+            s_rl, a_rl, r_rl, s2_rl, d_rl = s[rl_mask], a[rl_mask], r[rl_mask], s2[rl_mask], d[rl_mask]
 
-        td_error = (q1.detach() - y).abs().squeeze(-1)
+            with torch.no_grad():
+                noise = (torch.randn_like(a_rl) * self.cfg.policy_noise * self.max_action).clamp(
+                    -self.cfg.noise_clip * self.max_action,
+                    self.cfg.noise_clip * self.max_action,
+                )
+                next_a = self.actor_target(s2_rl) + noise
+                next_a = torch.max(torch.min(next_a, self.max_action), -self.max_action)
+                target_q1, target_q2 = self.critic_target(s2_rl, next_a)
+                target_q = torch.min(target_q1, target_q2)
+                y = r_rl + (1.0 - d_rl) * self.cfg.gamma * target_q
+                y = torch.clamp(y, -10.0, 10.0)
+
+            q1, q2 = self.critic(s_rl, a_rl)
+            critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+            self.critic_opt.step()
+
+            td_error[rl_mask] = (q1.detach() - y).abs().squeeze(-1)
+            critic_loss_val = float(critic_loss.item())
+
+            # 记录 Q 的绝对均值，用于 Actor BC Loss 的自适应权重
+            q_abs_mean = q1.detach().abs().mean().item()
+        else:
+            q_abs_mean = 1.0
+
         info = {
-            'critic_loss': float(critic_loss.item()),
+            'critic_loss': critic_loss_val,
             'td_error': td_error,
         }
 
+        # =====================================================================
+        # 2. Actor Update (混合数据：RL 数据优化 Q，EA 数据做 BC 正则化)
+        # =====================================================================
         self.total_updates += 1
         if self.total_updates % self.cfg.policy_freq == 0:
-            actor_loss = -self.critic.q1_only(s, self.actor(s)).mean()
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-            self.actor_opt.step()
+            actor_loss = torch.tensor(0.0, device=self.device)
+
+            # 2.1 对于 RL 数据：最大化 Q 值 (寻找超越 EA 的方向)
+            if rl_mask.any():
+                actor_loss_rl = -self.critic.q1_only(s[rl_mask], self.actor(s[rl_mask])).mean()
+                actor_loss = actor_loss + actor_loss_rl
+
+            # 2.2 对于 EA 数据：Behavior Cloning
+            if ea_mask.any():
+                pi_ea = self.actor(s[ea_mask])
+                bc_loss = F.mse_loss(pi_ea, a[ea_mask])
+
+                # 【接住补丁】：获取来自 Wrapper 的时间退火因子 (默认 1.0)
+                bc_decay = batch.get('bc_decay', torch.tensor(1.0, device=self.device)).item()
+
+                # TD3+BC 自适应退火：双重保障 (Q值自信度退火 + 时间硬性退火)
+                alpha = 2.5
+                lmbda = (alpha / (q_abs_mean + 1e-5)) * bc_decay
+
+                actor_loss = actor_loss + lmbda * bc_loss
+
+            if actor_loss.requires_grad:
+                self.actor_opt.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                self.actor_opt.step()
 
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
-            # info['actor_loss'] = float(actor_loss.item())
+            self.last_actor_loss = float(actor_loss.item())
 
-            self.last_actor_loss = float(actor_loss.item())  # 【新增】记录最新 loss
-
-        info['actor_loss'] = self.last_actor_loss  # 【新增】保证每次字典里都有这行
-
+        info['actor_loss'] = self.last_actor_loss
         return info
 
     def _soft_update(self, net, target_net):
