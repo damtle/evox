@@ -135,10 +135,14 @@ class RLEnhancedAlgorithm(Algorithm):
         sr_threshold_low = 0.005  # 0.5%
         sr_threshold_high = 0.05  # 5%
 
-        # 触发条件：
-        # 1. 常规模式：种群还很分散(需探索)，且 RL 最近至少有一点点苦劳(>0.5%)，则允许继续。
-        # 2. 破局模式：即使种群已经极度收敛(多样性低)，但只要 RL 表现极其神勇(成功率>5%)，说明 RL 正在带队冲锋，绝不喊停。
-        is_rl_useful = (
+        # 免死金牌：如果 Replay Buffer 还没攒够数据开始训练，无条件给 RL 放行！
+        is_training_started = len(self.replay) >= self.train_after
+
+        # 强制试探：每 50 代强行拉升一次信心，防止彻底死锁
+        if current_step > 0 and current_step % 50 == 0:
+            self.ema_success_rate = max(self.ema_success_rate, 0.5)
+
+        is_rl_useful = (not is_training_started) or (
                 (diversity > div_threshold and self.ema_success_rate > sr_threshold_low)
                 or (self.ema_success_rate > sr_threshold_high)
         )
@@ -174,15 +178,22 @@ class RLEnhancedAlgorithm(Algorithm):
             step_scale = (raw_action[:, self.dim:self.dim + 1] + 1.0) / 2.0
             # 3. 探索门控 [0, 1] (0: 纯局部修调 pop_std, 1: 纯全局大跳跃 ub-lb)
             explore_gate = (raw_action[:, self.dim + 1:self.dim + 2] + 1.0) / 2.0
-            
-            # 【修复问题 1】：加入 10% 的强制全局探索概率，防止网络退化为纯局部搜索
-            if torch.rand(1).item() < 0.1:
+
+            # 强制试探：5% 概率做极限大跳跃，5% 概率做种群内部大跨越
+            rand_val = torch.rand(1).item()
+            if rand_val < 0.05:
                 explore_gate = torch.ones_like(explore_gate)
+            elif rand_val < 0.10:
+                explore_gate = torch.zeros_like(explore_gate)
 
-            global_scale = (self.ub - self.lb)
+            # =========================================================================
+            # 【稳健 Patch 1】：温和放大物理尺度
+            # 局部：放大到 1.25 倍 pop_std，给一点探索空间但不破坏 Critic 的认知
+            # 全局：设为搜索空间的 10%，既能跳出当前 basin，又不算瞎跳
+            # =========================================================================
+            macro_scale = (self.ub - self.lb) * 0.1
+            effective_scale = (1.0 - explore_gate) * (pop_std * 1.25) + explore_gate * macro_scale
 
-            # 动态混合有效尺度
-            effective_scale = (1.0 - explore_gate) * pop_std + explore_gate * global_scale
             dx = direction * effective_scale * step_scale
 
             candidate_pop = pop[rl_indices] + dx
@@ -209,7 +220,7 @@ class RLEnhancedAlgorithm(Algorithm):
             escape_bonus = 0.5 * (is_stagnant.float() * improved_rl.float())
 
             # 最终的战略级奖励：Fitness (主目标) + Novelty (鼓励走新路) + Escape (鼓励拯救烂摊子)
-            reward = fit_reward + 0.05 * novelty_reward + escape_bonus
+            reward = fit_reward + 0.08 * novelty_reward + escape_bonus
 
             done = torch.zeros_like(reward)
             future_improvement = torch.clamp(fit[rl_indices] - candidate_fit, min=0.0)
@@ -234,7 +245,16 @@ class RLEnhancedAlgorithm(Algorithm):
             # 核心思想: 无论是 PSO 还是 DE，RL 只在个体的当前位置提供“局部梯度下降”
             # 绝不跨越生态位替换其他粒子，从而最大程度保护 EA 的种群多样性和探索能力
             # =========================================================================
-            better = candidate_fit < fit[rl_indices]
+            # 【稳健 Patch 3】：坚决拒绝毫无意义的微调，逼迫 RL 找真正有价值的解
+            rel_improvement = (fit[rl_indices] - candidate_fit) / (torch.abs(fit[rl_indices]) + 1e-8)
+
+            # 条件1：创造了新的全局最优 (无条件接受)
+            is_new_global = candidate_fit < self.global_best_fit
+            # 条件2：获得了实质性的局部提升 (大于万分之五 5e-4，门槛温和但足以拦住刷分)
+            is_significant = rel_improvement > 5e-4
+
+            # 必须严格更好，且满足实质性提升或全局最优才允许替换！
+            better = (candidate_fit < fit[rl_indices]) & (is_new_global | is_significant)
 
             num_success = better.sum().item()
 
@@ -266,7 +286,7 @@ class RLEnhancedAlgorithm(Algorithm):
 
             # 【新增】：平滑更新 EMA 成功率 (Alpha = 0.1)
             current_success_rate = num_success / max(1, n_rl)
-            self.ema_success_rate = 0.9 * self.ema_success_rate + 0.1 * current_success_rate
+            self.ema_success_rate = 0.95 * self.ema_success_rate + 0.05 * current_success_rate
 
         # 同步回底层 Algorithm
         self.base.pop = pop
@@ -279,6 +299,8 @@ class RLEnhancedAlgorithm(Algorithm):
         if current_best_val < self.global_best_fit:
             self.global_best_fit = current_best_val.clone()
             self.global_best_location = self.base.pop[current_best_idx].clone()
+
+            self.ema_success_rate = 1.0
 
         # 将 Wrapper 维护的全局最优，反向同步给需要的底层 EA
         if hasattr(self.base, 'global_best_fit'):  # 兼容 PSO

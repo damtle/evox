@@ -2,6 +2,8 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import logging
+from datetime import datetime
 
 # 强制 PyTorch 全局默认使用 GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -10,24 +12,42 @@ if torch.cuda.is_available():
 
 from evox.problems.numerical import CEC2022
 from evox.workflows import StdWorkflow, EvalMonitor
+# 注意：虽然你的文件名还叫 pso_rl，但里面的 base 已经可以随意换了
 from rl_ea.algorithms.pso_rl import make_rl_pso
 
 
-def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int = 500):
+def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int = 500, seed: int = 42):
+    # 为每次独立实验设置不同的随机种子，保证实验的严谨性
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     lb = -100.0 * torch.ones(dim, device=device)
     ub = 100.0 * torch.ones(dim, device=device)
+
+    # 预热期：可以根据需要修改
     warmup = int(max_generations * 0.1)
+
     algorithm = make_rl_pso(
         pop_size=100,
         lb=lb,
         ub=ub,
         device=device,
         enable_rl=enable_rl,
-        rl_candidate_ratio=0.05,  # 5% 的算力给 RL
+        rl_candidate_ratio=0.01,
         train_after=256,
         batch_size=128,
         warmup_gens=warmup
     )
+
+    # 【新增】：动态获取底层算法的真实名称 (比如 "CoDE", "SaDE", "PSO")
+    if enable_rl:
+        # 如果是 RL 包装器，取它 base 的类名
+        algo_name = algorithm.base.__class__.__name__
+    else:
+        # 如果是纯 EA，直接取它自己的类名
+        algo_name = algorithm.__class__.__name__
 
     problem = CEC2022(problem_number=func_id, dimension=dim, device=device)
 
@@ -60,43 +80,123 @@ def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int
 
         history.append(best_val)
 
-    return best_val, history
+    # 返回结果的同时，把动态获取的算法名字也传出去
+    return best_val, history, algo_name
+
+
+def setup_logger(log_file: str):
+    """设置双通道 Logger：同时输出到控制台和 txt 文件"""
+    logger = logging.getLogger("ExperimentLogger")
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter('%(message)s')
+
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setFormatter(formatter)
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
 
 
 def main():
     dim = 20
     max_generations = (10000 * dim) // 100
 
-    print(f"{'=' * 60}")
-    print(f"🚀 开始 CEC2022 批量测试并独立绘制收敛曲线 (D={dim}, Gens={max_generations})")
-    print(f"{'=' * 60}")
+    # 【核心配置】：独立运行的次数
+    num_runs = 5
 
-    # 【新增】：创建一个文件夹专门用来保存图片
-    output_dir = "convergence_results"
+    # 创建一个带有当前时间戳的独立文件夹
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"convergence_results/run_{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
 
+    log_file = os.path.join(output_dir, "experiment_log.txt")
+    logger = setup_logger(log_file)
+
+    logger.info(f"{'=' * 60}")
+    logger.info(f"🚀 开始 CEC2022 严谨测试 (D={dim}, Gens={max_generations}, Runs={num_runs})")
+    logger.info(f"📁 本次所有图表和日志将保存至: {output_dir}")
+    logger.info(f"{'=' * 60}")
+
     for func_id in range(1, 13):
-        print(f"\n正在运行 F{func_id}...")
-        # if func_id < 6:
-        #     continue
-        # 1. 跑纯 EA 基准
-        best_baseline, hist_baseline = run_experiment(func_id, dim, enable_rl=False, max_generations=max_generations)
-        # 2. 跑 RL 增强的 EA
-        best_rl, hist_rl = run_experiment(func_id, dim, enable_rl=True, max_generations=max_generations)
+        if func_id < 6:
+            continue
+        logger.info(f"\n正在运行 F{func_id}...")
 
-        winner = "👑 RL" if best_rl < best_baseline else "👑 EA" if best_baseline < best_rl else "Tie"
-        print(f"F{func_id:<2} | Base: {best_baseline:<15.4f} | RL: {best_rl:<15.4f} | {winner}")
+        histories_base = []
+        best_vals_base = []
+        histories_rl = []
+        best_vals_rl = []
 
-        # ==== 独立绘制子图 ====
-        # 每次循环都新建一个清晰度高、尺寸适中的画布
+        base_algo_name = "EA"  # 默认占位符
+
+        for run in range(num_runs):
+            current_seed = 42 + run * 100
+
+            # 1. 跑纯 EA 基准
+            best_base, hist_base, base_algo_name = run_experiment(func_id, dim, enable_rl=False,
+                                                                  max_generations=max_generations, seed=current_seed)
+            histories_base.append(hist_base)
+            best_vals_base.append(best_base)
+
+            # 2. 跑 RL 增强的 EA
+            best_rl, hist_rl, _ = run_experiment(func_id, dim, enable_rl=True, max_generations=max_generations,
+                                                 seed=current_seed)
+            histories_rl.append(hist_rl)
+            best_vals_rl.append(best_rl)
+
+            # 日志动态显示算法名
+            logger.info(
+                f"   - Run {run + 1}/{num_runs} | Pure {base_algo_name}: {best_base:<12.4f} | RL-{base_algo_name}: {best_rl:<12.4f}")
+
+        # ==== 统计学计算 ====
+        mean_best_base = np.mean(best_vals_base)
+        std_best_base = np.std(best_vals_base)
+        mean_best_rl = np.mean(best_vals_rl)
+        std_best_rl = np.std(best_vals_rl)
+
+        mat_hist_base = np.array(histories_base)
+        mat_hist_rl = np.array(histories_rl)
+
+        mean_hist_base = np.mean(mat_hist_base, axis=0)
+        std_hist_base = np.std(mat_hist_base, axis=0)
+
+        mean_hist_rl = np.mean(mat_hist_rl, axis=0)
+        std_hist_rl = np.std(mat_hist_rl, axis=0)
+
+        winner = "👑 RL" if mean_best_rl < mean_best_base else "👑 EA" if mean_best_base < mean_best_rl else "Tie"
+        # 汇总日志也动态显示
+        logger.info(
+            f"⭐ F{func_id:<2} 汇总 | Pure {base_algo_name}: {mean_best_base:.4f} ± {std_best_base:.4f} | RL-{base_algo_name}: {mean_best_rl:.4f} ± {std_best_rl:.4f} | {winner}")
+
+        # ==== 独立绘制带有波动区间的阴影子图 ====
         fig, ax = plt.subplots(figsize=(8, 6))
+        generations = np.arange(len(mean_hist_base))
 
-        # 技巧：CEC2022 函数的适应度通常在数百到数千，下降幅度极大，用对数坐标轴 (log scale) 最能看清后期微小的差距
-        ax.plot(hist_baseline, label='Pure SaDE', color='#1f77b4', linewidth=2)
-        ax.plot(hist_rl, label='RL-SaDE', color='#d62728', linewidth=2, linestyle='--')
+        # 【绘制 Base 曲线与阴影，图例动态显示名称】
+        ax.plot(generations, mean_hist_base, label=f'Pure {base_algo_name} (Mean)', color='#1f77b4', linewidth=2)
+        ax.fill_between(generations,
+                        np.clip(mean_hist_base - std_hist_base, a_min=1e-5, a_max=None),
+                        mean_hist_base + std_hist_base,
+                        color='#1f77b4', alpha=0.2)
 
-        ax.set_title(f'F{func_id} Convergence (D={dim})', fontsize=14, fontweight='bold')
-        ax.set_yscale('log')  # 启用 Y轴对数刻度
+        # 【绘制 RL 曲线与阴影，图例动态显示名称】
+        ax.plot(generations, mean_hist_rl, label=f'RL-{base_algo_name} (Mean)', color='#d62728', linewidth=2,
+                linestyle='--')
+        ax.fill_between(generations,
+                        np.clip(mean_hist_rl - std_hist_rl, a_min=1e-5, a_max=None),
+                        mean_hist_rl + std_hist_rl,
+                        color='#d62728', alpha=0.2)
+
+        ax.set_title(f'F{func_id} Convergence ({base_algo_name}, D={dim}, Runs={num_runs})', fontsize=14,
+                     fontweight='bold')
+        ax.set_yscale('log')
         ax.set_xlabel('Generations', fontsize=12)
         ax.set_ylabel('Fitness (Log Scale)', fontsize=12)
         ax.legend(fontsize=11)
@@ -104,21 +204,14 @@ def main():
 
         plt.tight_layout()
 
-        # 拼接文件路径并保存
-        plot_filename = os.path.join(output_dir, f"F{func_id}_convergence_{max_generations}gens.png")
+        plot_filename = os.path.join(output_dir, f"F{func_id}_convergence_{num_runs}runs.png")
         plt.savefig(plot_filename, dpi=300)
-
-        # 【关键】：保存完毕后必须关闭画布，否则会发生内存泄漏，并且下一张图会和上一张图重叠
         plt.close(fig)
 
-        print(f"📈 F{func_id} 收敛曲线图已实时保存至: {os.path.abspath(plot_filename)}")
+        logger.info(f"📈 F{func_id} 图表已保存: {os.path.abspath(plot_filename)}")
 
-    print(f"\n{'=' * 60}")
-    print(f"✅ 全部测试完成！所有图片均已存入 '{output_dir}' 文件夹。")
-
-
-if __name__ == "__main__":
-    main()
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"✅ 全部测试完成！所有图表和包含 Mean±Std 的日志均已存入:\n   '{os.path.abspath(output_dir)}'")
 
 
 if __name__ == "__main__":

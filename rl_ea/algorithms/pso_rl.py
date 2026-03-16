@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from evox.algorithms import PSO, SaDE
+from evox.algorithms import PSO, SaDE, CoDE
 
 from rl_ea.rl.agent import TD3Agent, TD3Config
 from rl_ea.replay.buffer import PrioritizedReplayBuffer
@@ -27,7 +27,7 @@ def make_rl_pso(
 ):
     device = torch.get_default_device() if device is None else device
     # base = PSO(pop_size=pop_size, lb=lb, ub=ub, w=w, phi_p=phi_p, phi_g=phi_g, device=device)
-    base = SaDE(pop_size, lb, ub, device=device)
+    base = CoDE(pop_size, lb, ub, device=device)
     if not enable_rl:
         return base
 
