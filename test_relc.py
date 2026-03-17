@@ -90,7 +90,7 @@ def setup_logger(log_file: str):
 
 def main():
     dim = 20
-    max_generations = (10000 * dim) // 100
+    max_generations = (20000 * dim) // 100
     num_runs = 5
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -143,16 +143,18 @@ def main():
 
         # --- 图 1: 收敛曲线 ---
         ax1.plot(generations, mean_hist_base, label=f'Pure {base_algo_name}', color='#1f77b4', linewidth=2)
-        ax1.fill_between(generations, np.clip(mean_hist_base - std_hist_base, a_min=1e-8, a_max=None),
+        ax1.fill_between(generations, np.clip(mean_hist_base - std_hist_base, a_min=0, a_max=None),
                          mean_hist_base + std_hist_base, color='#1f77b4', alpha=0.2)
         ax1.plot(generations, mean_hist_rl, label=f'RLEC-{base_algo_name}', color='#d62728', linewidth=2,
                  linestyle='--')
-        ax1.fill_between(generations, np.clip(mean_hist_rl - std_hist_rl, a_min=1e-8, a_max=None),
+        ax1.fill_between(generations, np.clip(mean_hist_rl - std_hist_rl, a_min=0, a_max=None),
                          mean_hist_rl + std_hist_rl, color='#d62728', alpha=0.2)
+
         ax1.set_title(f'F{func_id} Convergence', fontsize=14, fontweight='bold')
-        ax1.set_yscale('log')
+        # 【修改点 1】：删除了 ax1.set_yscale('log')
         ax1.set_xlabel('Generations', fontsize=12)
-        ax1.set_ylabel('Fitness Error (Log Scale)', fontsize=12)
+        # 【修改点 2】：去掉了 ylabel 里的 (Log Scale)
+        ax1.set_ylabel('Fitness Error', fontsize=12)
         ax1.legend(fontsize=11)
         ax1.grid(True, which="both", ls="--", alpha=0.5)
 
