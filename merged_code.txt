@@ -1,284 +1,4 @@
-### 1. 项目结构概览
-----------------------------------------
-[Main] test_relc.py
-rlec/
-    __init__.py
-    algorithms/
-        __init__.py
-        code_rlec.py
-        rlec_wrapper.py
-    control/
-        __init__.py
-        intent_vector.py
-        interpreter.py
-    features/
-        __init__.py
-        macro_state.py
-        stage_reward.py
-    rl/
-        __init__.py
-        networks.py
-        ppo.py
-        rollout_buffer.py
-    utils/
-        __init__.py
-        population_metrics.py
-
-
-### 2. 代码详细内容
-==================================================
-
-// [MAIN 入口] File: test_relc.py
-----------------------------------------
-import torch
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-import logging
-from datetime import datetime
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-if torch.cuda.is_available():
-    torch.set_default_device(device)
-
-from evox.problems.numerical import CEC2022
-from evox.workflows import StdWorkflow, EvalMonitor
-from rlec.algorithms.code_rlec import make_rlec_code
-
-
-def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int = 500, seed: int = 42):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    lb = -100.0 * torch.ones(dim, device=device)
-    ub = 100.0 * torch.ones(dim, device=device)
-
-    algorithm = make_rlec_code(
-        pop_size=100, lb=lb, ub=ub, device=device,
-        stage_length=10, update_stages=2, enable_rl=enable_rl
-    )
-
-    algo_name = algorithm.base.__class__.__name__ if enable_rl else algorithm.__class__.__name__
-    problem = CEC2022(problem_number=func_id, dimension=dim, device=device)
-
-    for attr in ['OShift', 'M', 'SS']:
-        if hasattr(problem, attr) and getattr(problem, attr) is not None:
-            setattr(problem, attr, getattr(problem, attr).to(device))
-
-    optimum_values = {
-        1: 300, 2: 400, 3: 600, 4: 800, 5: 900,
-        6: 1800, 7: 2000, 8: 2200, 9: 2300, 10: 2400, 11: 2600, 12: 2700
-    }
-    f_star = optimum_values.get(func_id, 0.0)
-
-    original_evaluate = problem.evaluate
-
-    def shifted_evaluate(state: torch.Tensor) -> torch.Tensor:
-        return original_evaluate(state) - f_star
-
-    problem.evaluate = shifted_evaluate
-
-    monitor = EvalMonitor()
-    workflow = StdWorkflow(algorithm, problem, monitor)
-
-    history = []
-    # 【新增】：专门记录每一代的 6D 控制意图
-    intent_history = []
-
-    workflow.init_step()
-    best_val = algorithm.global_best_fit.item() if hasattr(algorithm, 'global_best_fit') else torch.min(
-        algorithm.fit).item()
-    history.append(best_val)
-
-    for gen in range(max_generations):
-        workflow.step()
-
-        best_val = algorithm.global_best_fit.item() if hasattr(algorithm, 'global_best_fit') else torch.min(
-            algorithm.fit).item()
-        history.append(best_val)
-
-        # 记录当前活跃的 Intent 向量 (仅当启用了 RL)
-        if enable_rl and hasattr(algorithm, 'last_intent'):
-            intent_history.append(algorithm.last_intent.detach().cpu().numpy())
-
-    return best_val, history, np.array(intent_history), algo_name
-
-
-def setup_logger(log_file: str):
-    logger = logging.getLogger("RLECLogger")
-    logger.setLevel(logging.INFO)
-    if logger.hasHandlers(): logger.handlers.clear()
-    formatter = logging.Formatter('%(message)s')
-    fh = logging.FileHandler(log_file, encoding='utf-8')
-    fh.setFormatter(formatter)
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
-
-
-def main():
-    dim = 20
-    max_generations = (10000 * dim) // 100
-    num_runs = 5
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"convergence_results/rlec_{timestamp}"
-    os.makedirs(output_dir, exist_ok=True)
-
-    log_file = os.path.join(output_dir, "rlec_experiment_log.txt")
-    logger = setup_logger(log_file)
-
-    logger.info(
-        f"{'=' * 65}\n🚀 开始 RLEC (PPO-MLP 元进化控制框架) 严谨测试\n   D={dim}, Gens={max_generations}, Runs={num_runs}\n📁 保存至: {output_dir}\n{'=' * 65}")
-
-    for func_id in range(1, 13):
-        logger.info(f"\n正在运行 F{func_id}...")
-
-        histories_base, best_vals_base = [], []
-        histories_rl, best_vals_rl, intents_rl = [], [], []
-        base_algo_name = "EA"
-
-        for run in range(num_runs):
-            current_seed = 42 + run * 100
-
-            best_b, hist_b, _, base_algo_name = run_experiment(func_id, dim, False, max_generations, current_seed)
-            histories_base.append(hist_b)
-            best_vals_base.append(best_b)
-
-            best_r, hist_r, intent_r, _ = run_experiment(func_id, dim, True, max_generations, current_seed)
-            histories_rl.append(hist_r)
-            best_vals_rl.append(best_r)
-            intents_rl.append(intent_r)
-
-            logger.info(
-                f"   - Run {run + 1}/{num_runs} | Pure {base_algo_name}: {best_b:<12.4e} | RLEC-{base_algo_name}: {best_r:<12.4e}")
-
-        mean_best_base, std_best_base = np.mean(best_vals_base), np.std(best_vals_base)
-        mean_best_rl, std_best_rl = np.mean(best_vals_rl), np.std(best_vals_rl)
-
-        mean_hist_base, std_hist_base = np.mean(histories_base, axis=0), np.std(histories_base, axis=0)
-        mean_hist_rl, std_hist_rl = np.mean(histories_rl, axis=0), np.std(histories_rl, axis=0)
-
-        winner = "👑 RLEC" if mean_best_rl < mean_best_base else "👑 EA" if mean_best_base < mean_best_rl else "Tie"
-        logger.info(
-            f"⭐ F{func_id:<2} 汇总 | Pure {base_algo_name}: {mean_best_base:.4e} ± {std_best_base:.4e} | RLEC-{base_algo_name}: {mean_best_rl:.4e} ± {std_best_rl:.4e} | {winner}")
-
-        # =========================================================
-        # 👑 双图表绘制：左图收敛曲线，右图 6D 控制意图时序演化！
-        # =========================================================
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-        generations = np.arange(len(mean_hist_base))
-
-        # --- 图 1: 收敛曲线 ---
-        ax1.plot(generations, mean_hist_base, label=f'Pure {base_algo_name}', color='#1f77b4', linewidth=2)
-        ax1.fill_between(generations, np.clip(mean_hist_base - std_hist_base, a_min=1e-8, a_max=None),
-                         mean_hist_base + std_hist_base, color='#1f77b4', alpha=0.2)
-        ax1.plot(generations, mean_hist_rl, label=f'RLEC-{base_algo_name}', color='#d62728', linewidth=2,
-                 linestyle='--')
-        ax1.fill_between(generations, np.clip(mean_hist_rl - std_hist_rl, a_min=1e-8, a_max=None),
-                         mean_hist_rl + std_hist_rl, color='#d62728', alpha=0.2)
-        ax1.set_title(f'F{func_id} Convergence', fontsize=14, fontweight='bold')
-        ax1.set_yscale('log')
-        ax1.set_xlabel('Generations', fontsize=12)
-        ax1.set_ylabel('Fitness Error (Log Scale)', fontsize=12)
-        ax1.legend(fontsize=11)
-        ax1.grid(True, which="both", ls="--", alpha=0.5)
-
-        # --- 图 2: 6D 搜索意图演化轨迹 ---
-        # 计算 5 次运行的 Intent 均值轨迹 shape: [max_generations, 6]
-        mean_intents = np.mean(intents_rl, axis=0)
-        labels = ['Exploration (e)', 'Exploitation (x)', 'Diversity Target (d)', 'Budget (b)', 'Rescue (r)',
-                  'Elite Protect (p)']
-        colors = ['#ff7f0e', '#2ca02c', '#2bc1ff', '#d62728', '#9467bd', '#8c564b']
-
-        # 为了折线图不至于太密集，我们做一点平滑处理或按阶段取样
-        gens_intent = np.arange(len(mean_intents))
-        for i in range(6):
-            # 用一点指数滑动平均(EMA)让轨迹更平滑好看
-            smoothed = []
-            val = mean_intents[0, i]
-            for v in mean_intents[:, i]:
-                val = 0.9 * val + 0.1 * v
-                smoothed.append(val)
-            ax2.plot(gens_intent, smoothed, label=labels[i], color=colors[i], linewidth=2)
-
-        ax2.set_title(f'F{func_id} 6D Intent Trajectory (RLEC)', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Generations', fontsize=12)
-        ax2.set_ylabel('Intent Intensity [0, 1]', fontsize=12)
-        ax2.set_ylim(-0.05, 1.05)
-        ax2.legend(fontsize=10, loc='upper right', bbox_to_anchor=(1.25, 1))
-        ax2.grid(True, ls="--", alpha=0.5)
-
-        plt.tight_layout()
-        plot_filename = os.path.join(output_dir, f"F{func_id}_analysis_{num_runs}runs.png")
-        plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        plt.close(fig)
-
-        logger.info(f"📈 F{func_id} 分析图表已保存: {os.path.abspath(plot_filename)}")
-
-    logger.info(f"\n{'=' * 65}\n✅ 全部测试完成！\n{'=' * 65}")
-
-
-if __name__ == "__main__":
-    main()
-
-==================================================
-
-// [MODULE] File: rlec\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\algorithms\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\algorithms\code_rlec.py
-----------------------------------------
 from typing import Optional
-import torch
-from evox.algorithms import CoDE, DE
-from rlec.algorithms.rlec_wrapper import RLECWrapper
-
-
-def make_rlec_code(
-        pop_size: int,
-        lb: torch.Tensor,
-        ub: torch.Tensor,
-        device: Optional[torch.device] = None,
-        stage_length: int = 20,
-        update_stages: int = 5,
-        enable_rl: bool = True
-):
-    """
-    快速创建一个被 RLEC 控制器包裹的 CoDE 算法实例
-    """
-    device = torch.get_default_device() if device is None else device
-    base_code = DE(pop_size, lb, ub, device=device)
-
-    if not enable_rl:
-        return base_code
-
-    algo = RLECWrapper(
-        base_algo=base_code,
-        stage_length=stage_length,
-        update_stages=update_stages,
-        device=device
-    )
-    return algo
-
-==================================================
-
-// [MODULE] File: rlec\algorithms\rlec_wrapper.py
-----------------------------------------
-﻿from typing import Optional
 import torch
 
 from evox.core import Algorithm, Mutable
@@ -363,8 +83,10 @@ class RLECWrapper(Algorithm):
         self.current_cmd_middle = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_quiet = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_target_div = Mutable(torch.tensor(0.0, device=self.device))
-        self.current_refinement_mode = Mutable(torch.tensor(False, dtype=torch.bool, device=self.device))
-        self.current_rescue_strength = Mutable(torch.tensor(1.0, device=self.device))
+        self.current_gate_refine = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_gate_recover = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_convergence_lock = Mutable(torch.tensor(False, dtype=torch.bool, device=self.device))
+        self.last_intent_eff = Mutable(torch.zeros(6, device=self.device))
 
         # 鍖呰鍣ㄨ嚜宸辩淮鎶ょ殑鏈€浼樿褰?
         self.global_best_fit = Mutable(torch.tensor(torch.inf, device=self.device))
@@ -432,7 +154,7 @@ class RLECWrapper(Algorithm):
             pop_t=current_pop, fit_t=current_fit,
             pop_t_minus_k=self.stage_start_pop, fit_t_minus_k=self.stage_start_fit,
             stagnation=self.stagnation,
-            last_action=self.last_intent,
+            last_action=self.last_intent_eff,
             feedback_stats=torch.stack([
                 self.last_intervene_ratio,
                 self.last_accept_ratio,
@@ -453,9 +175,7 @@ class RLECWrapper(Algorithm):
         intent_tensor = torch.tensor(intent_np, device=self.device, dtype=torch.float32)
         intent_obj = IntentVector.from_tensor(intent_tensor)
 
-        # Safety fallback for weak EA:
-        # when a stage has almost no progress and diversity is near-collapse,
-        # force stronger exploration/rescue budgets.
+        # Continuous gates: do not overwrite actions, only rescale their effects.
         stage_best_start = torch.min(self.stage_start_fit)
         stage_best_now = torch.min(current_fit)
         stage_progress = (stage_best_start - stage_best_now) / (torch.abs(stage_best_start) + 1e-8)
@@ -464,47 +184,70 @@ class RLECWrapper(Algorithm):
         median_now = torch.median(current_fit)
         spread_ratio = (median_now - best_now) / (torch.abs(best_now) + 1e-8)
         stag_ratio = torch.mean((self.stagnation >= 10).float())
+        best_prev = torch.min(self.stage_start_fit)
+        best_improve_abs = torch.abs(best_prev - best_now)
 
-        # Refinement mode: convergence in a compact basin, reduce interference.
-        is_refinement_mode = bool(
-            (div_ratio.item() < 0.08 and spread_ratio.item() < 0.15 and stag_ratio.item() > 0.3)
-            or (stage_progress.item() < 1e-5 and spread_ratio.item() < 0.08 and div_ratio.item() < 0.12)
+        # Hard convergence lock: once population is very compact and progress is tiny,
+        # disable exploration/rescue to preserve DE fine-grained convergence.
+        is_converged = bool(
+            (current_div.item() < 1e-3 and best_improve_abs.item() < 1e-6)
+            or (current_div.item() < 5e-4 and best_now.item() < 1e-4)
         )
 
-        if is_refinement_mode:
-            intent_obj = IntentVector(
-                e_t=min(intent_obj.e_t, 0.05),
-                x_t=max(intent_obj.x_t, 0.75),
-                d_t=min(intent_obj.d_t, 0.20),
-                b_t=min(intent_obj.b_t, 0.08),
-                r_t=min(intent_obj.r_t, 0.03),
-                p_t=max(intent_obj.p_t, 0.95),
-            )
-            self.current_refinement_mode = torch.tensor(True, dtype=torch.bool, device=self.device)
-            self.current_rescue_strength = torch.tensor(0.30, device=self.device)
+        refine_div = torch.clamp((0.15 - div_ratio) / 0.15, 0.0, 1.0)
+        refine_spread = torch.clamp((0.20 - spread_ratio) / 0.20, 0.0, 1.0)
+        refine_prog = torch.clamp((1e-4 - stage_progress) / 1e-4, 0.0, 1.0)
+        refine_stag = torch.clamp((stag_ratio - 0.2) / 0.6, 0.0, 1.0)
+        g_refine = torch.clamp(
+            0.35 * refine_div
+            + 0.25 * refine_spread
+            + 0.20 * refine_prog
+            + 0.20 * refine_stag,
+            0.0,
+            1.0,
+        )
+
+        recover_div = torch.clamp((0.18 - div_ratio) / 0.18, 0.0, 1.0)
+        recover_prog = torch.clamp((1e-4 - stage_progress) / 1e-4, 0.0, 1.0)
+        recover_spread = torch.clamp((spread_ratio - 0.20) / 0.40, 0.0, 1.0)
+        g_recover = torch.clamp(
+            0.40 * recover_div
+            + 0.30 * recover_prog
+            + 0.30 * recover_spread,
+            0.0,
+            1.0,
+        ) * (1.0 - g_refine)
+
+        e_eff = torch.clamp(intent_tensor[0] * (1.0 - 0.85 * g_refine) + 0.50 * g_recover * (1.0 - intent_tensor[0]), 0.0, 1.0)
+        x_eff = torch.clamp(intent_tensor[1] + 0.25 * g_refine * (1.0 - intent_tensor[1]), 0.0, 1.0)
+        d_eff = torch.clamp(intent_tensor[2] * (1.0 - 0.50 * g_refine) + 0.30 * g_recover * (1.0 - intent_tensor[2]), 0.0, 1.0)
+        b_eff = torch.clamp(intent_tensor[3] * (1.0 - 0.75 * g_refine) + 0.45 * g_recover * (1.0 - intent_tensor[3]), 0.0, 1.0)
+        r_eff = torch.clamp(intent_tensor[4] * (1.0 - 0.90 * g_refine) + 0.35 * g_recover * (1.0 - intent_tensor[4]), 0.0, 1.0)
+        p_eff = torch.clamp(intent_tensor[5] + 0.30 * g_refine * (1.0 - intent_tensor[5]), 0.0, 1.0)
+
+        intent_eff_tensor = torch.stack([e_eff, x_eff, d_eff, b_eff, r_eff, p_eff]).to(self.device)
+
+        if is_converged:
+            # Full lock to local exploitation behavior.
+            intent_eff_tensor[0] = 0.0  # e
+            intent_eff_tensor[3] = 0.0  # b
+            intent_eff_tensor[4] = 0.0  # r
+            intent_eff_tensor[2] = 0.0  # d
+            intent_eff_tensor[5] = torch.clamp(torch.maximum(intent_eff_tensor[5], torch.tensor(0.98, device=self.device)), 0.0, 1.0)  # p
+            self.current_convergence_lock = torch.tensor(True, dtype=torch.bool, device=self.device)
         else:
-            # Weak-EA fallback: no progress + collapse but not a tight-quality basin.
-            if stage_progress.item() < 1e-4 and div_ratio.item() < 0.15 and spread_ratio.item() > 0.20:
-                intent_obj = IntentVector(
-                    e_t=max(intent_obj.e_t, 0.65),
-                    x_t=min(intent_obj.x_t, 0.45),
-                    d_t=max(intent_obj.d_t, 0.60),
-                    b_t=max(intent_obj.b_t, 0.35),
-                    r_t=max(intent_obj.r_t, 0.25),
-                    p_t=max(intent_obj.p_t, 0.80),
-                )
-            self.current_refinement_mode = torch.tensor(False, dtype=torch.bool, device=self.device)
-            self.current_rescue_strength = torch.tensor(1.0, device=self.device)
+            self.current_convergence_lock = torch.tensor(False, dtype=torch.bool, device=self.device)
 
-        intent_tensor = torch.tensor(
-            [intent_obj.e_t, intent_obj.x_t, intent_obj.d_t, intent_obj.b_t, intent_obj.r_t, intent_obj.p_t],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        cmd = self.interpreter.interpret(intent_obj, current_fit, self.stagnation, self.initial_div.item())
+        intent_eff_obj = IntentVector.from_tensor(intent_eff_tensor)
+
+        self.current_gate_refine = g_refine.detach()
+        self.current_gate_recover = g_recover.detach()
+
+        cmd = self.interpreter.interpret(intent_eff_obj, current_fit, self.stagnation, self.initial_div.item())
 
         self.last_action_raw = torch.tensor(action_raw, device=self.device)
         self.last_intent = intent_tensor.clone()
+        self.last_intent_eff = intent_eff_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device)
         self.last_value = torch.tensor(value, device=self.device)
 
@@ -517,6 +260,17 @@ class RLECWrapper(Algorithm):
         self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
         self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
         self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
+
+        # Sync any potential interpreter-side normalized clipping back to effective action.
+        intent_eff_tensor = torch.tensor(
+            [
+                intent_eff_obj.e_t, intent_eff_obj.x_t, intent_eff_obj.d_t,
+                intent_eff_obj.b_t, intent_eff_obj.r_t, intent_eff_obj.p_t
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.last_intent_eff = intent_eff_tensor.clone()
 
         # # 5. 銆愮‖鏍告垬鏈姩浣滐細鐮村眬鏁戞彺銆?
         # # 鍦ㄩ樁娈靛垵锛屽琚爣璁颁负 rescue 鐨勭矑瀛愭柦鍔犳棤瑙嗙墿鐞嗚寰嬬殑闅忔満浼犻€侊紒
@@ -564,7 +318,7 @@ class RLECWrapper(Algorithm):
                 stagnation_start=self.stage_start_stagnation,
                 stag_ratio_start=stag_ratio_start.item(),
                 stag_ratio_end=stag_ratio_end.item(),
-                action=self.last_intent,
+                action=self.last_intent_eff,
                 feedbacks=feedbacks
             )
             self.rl_agent.buffer.add(
@@ -592,14 +346,14 @@ class RLECWrapper(Algorithm):
         pop_std = torch.std(curr_pop, dim=0) + 1e-8
         trial_pop = curr_pop.clone()
 
-        intent = IntentVector.from_tensor(self.last_intent)
+        intent = IntentVector.from_tensor(self.last_intent_eff)
         middle_mask = self.current_cmd_middle
         rescue_mask = self.current_cmd_rescue
         quiet_mask = self.current_cmd_quiet
-        refinement_mode = bool(self.current_refinement_mode.item())
+        refine_gate = float(self.current_gate_refine.item())
 
-        # Keep good stagnation particles quiet in refinement mode.
-        if refinement_mode:
+        # Keep good stagnation particles quiet when refinement gate is high.
+        if refine_gate > 0.5:
             middle_mask = middle_mask & (~quiet_mask)
             rescue_mask = rescue_mask & (~quiet_mask)
 
@@ -607,6 +361,9 @@ class RLECWrapper(Algorithm):
         if middle_mask.any() and intent.e_t > 0.01:
             mid_scales = self.current_cmd_scales[middle_mask].unsqueeze(1)
             noise = torch.randn_like(trial_pop[middle_mask]) * pop_std * intent.e_t * mid_scales
+            # Ignore numerically tiny perturbations in late fine-search.
+            small_noise = torch.norm(noise, dim=1, keepdim=True) < 1e-6
+            noise = torch.where(small_noise, torch.zeros_like(noise), noise)
             trial_pop[middle_mask] += noise
 
         # 2. 寮€鍙戞媺鎷?(x)
@@ -619,8 +376,11 @@ class RLECWrapper(Algorithm):
         # 3. 鍋滄粸鏁戞彺 (r) - 淇¤禆鍩熷紡鎭㈠
         if rescue_mask.any():
             rescue_scales = self.current_cmd_scales[rescue_mask].unsqueeze(1)
-            trial_pop[rescue_mask] = self.global_best_location + torch.randn_like(
-                trial_pop[rescue_mask]) * pop_std * 2.0 * self.current_rescue_strength * rescue_scales
+            rescue_strength = 1.0 - 0.8 * refine_gate
+            base_pos = curr_pop[rescue_mask]
+            to_best = self.global_best_location - base_pos
+            noise = torch.randn_like(base_pos) * pop_std * 0.5 * rescue_strength * rescue_scales
+            trial_pop[rescue_mask] = base_pos + 0.3 * to_best + noise
 
         trial_pop = clamp(trial_pop, self.lb, self.ub)
 
@@ -628,6 +388,8 @@ class RLECWrapper(Algorithm):
         # 绗笁闃舵锛氳椽蹇冧繚搴曢獙鏀朵笌鍙嶉鏀堕泦
         # =====================================================================
         modified_mask = middle_mask | rescue_mask
+        if bool(self.current_convergence_lock.item()):
+            modified_mask = torch.zeros_like(modified_mask)
         n_mod = modified_mask.sum().float()
 
         if n_mod > 0:
@@ -638,7 +400,7 @@ class RLECWrapper(Algorithm):
             strict_accept = trial_fit < curr_fit
             margin_fit = curr_fit + torch.abs(curr_fit) * self.current_cmd_alpha_margin + self.current_cmd_beta_margin
             soft_accept = trial_fit < margin_fit
-            if refinement_mode:
+            if refine_gate > 0.65:
                 accept_mask = strict_accept
             else:
                 accept_mask = strict_accept | (rescue_mask & soft_accept)
@@ -697,54 +459,7 @@ class RLECWrapper(Algorithm):
         self.step_counter = self.step_counter + 1
 
 
-==================================================
-
-// [MODULE] File: rlec\control\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\control\intent_vector.py
-----------------------------------------
 import torch
-from dataclasses import dataclass
-
-
-@dataclass
-class IntentVector:
-    """
-    RLEC 战略意图向量 (6D)
-    所有值均被规范化到 [0, 1] 范围内
-    """
-    e_t: float  # Exploration pressure (探索压力): 鼓励大跨度搜索，容忍变差
-    x_t: float  # Exploitation pressure (开发压力): 鼓励局部微调，严格要求提升
-    d_t: float  # Diversity target (多样性目标): 0.0 代表允许坍缩，1.0 代表极度分散
-    b_t: float  # Intervention budget (干预预算): 本阶段允许干预的最大个体比例
-    r_t: float  # Rescue budget (脱困预算): 给停滞个体分配的重构资源比例
-    p_t: float  # Elite protection (精英保护): 精英个体免受随机扰动的保护强度
-
-    @classmethod
-    def from_tensor(cls, action_tensor: torch.Tensor) -> 'IntentVector':
-        """
-        将 PPO 网络的输出（通常在 [-1, 1] 之间）映射到 [0, 1] 的物理意图区间
-        """
-        a = torch.clamp(action_tensor.squeeze(), 0.0, 1.0).tolist()
-
-        return cls(
-            e_t=a[0], x_t=a[1], d_t=a[2],
-            b_t=a[3], r_t=a[4], p_t=a[5]
-        )
-
-    def __repr__(self):
-        return (f"Intent[Explor:{self.e_t:.2f}, Exploit:{self.x_t:.2f}, Div:{self.d_t:.2f}, "
-                f"Budget:{self.b_t:.2f}, Rescue:{self.r_t:.2f}, Elite:{self.p_t:.2f}]")
-
-==================================================
-
-// [MODULE] File: rlec\control\interpreter.py
-----------------------------------------
-﻿import torch
 from dataclasses import dataclass
 from .intent_vector import IntentVector
 
@@ -829,7 +544,8 @@ class ControlInterpreter:
         alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
         beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
 
-        target_diversity = initial_div * (0.1 + 0.9 * intent.d_t)
+        # Allow true convergence to near-zero diversity in refinement stage.
+        target_diversity = initial_div * intent.d_t
 
         return EACommand(
             protected_mask=protected_mask,
@@ -843,75 +559,6 @@ class ControlInterpreter:
         )
 
 
-==================================================
-
-// [MODULE] File: rlec\features\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\features\macro_state.py
-----------------------------------------
-import torch
-from rlec.utils.population_metrics import (
-    compute_diversity,
-    compute_fitness_skewness,
-    compute_rank_entropy,
-    compute_stagnation_ratio,
-    compute_elite_separation  # 引入新特征
-)
-
-
-class MacroStateBuilder:
-    def __init__(self, dim: int, pop_size: int):
-        self.dim = dim
-        self.pop_size = pop_size
-        self.state_dim = 18  # 8(基础) + 6(动作) + 4(反馈)
-
-    def build(self,
-              pop_t: torch.Tensor, fit_t: torch.Tensor,
-              pop_t_minus_k: torch.Tensor, fit_t_minus_k: torch.Tensor,
-              stagnation: torch.Tensor,
-              last_action: torch.Tensor,
-              feedback_stats: torch.Tensor) -> torch.Tensor:  # 新增 feedback 参数
-
-        device = pop_t.device
-
-        # 1. 进展与结构特征 (计算同原版)
-        best_t, best_t_k = torch.min(fit_t), torch.min(fit_t_minus_k)
-        median_t, median_t_k = torch.median(fit_t), torch.median(fit_t_minus_k)
-        prog_best = (best_t_k - best_t) / (torch.abs(best_t_k) + 1e-8)
-        prog_median = (median_t_k - median_t) / (torch.abs(median_t_k) + 1e-8)
-
-        div_t = compute_diversity(pop_t)
-        div_t_k = compute_diversity(pop_t_minus_k)
-        div_change = (div_t - div_t_k) / (div_t_k + 1e-8)
-        stag_ratio = compute_stagnation_ratio(stagnation, threshold=10)
-        separation = compute_elite_separation(pop_t, fit_t)
-        skewness = compute_fitness_skewness(fit_t)
-        entropy = compute_rank_entropy(fit_t)
-
-        # 拼接 18 维状态 (去除 ROI，全量保留 action)
-        state = torch.cat([
-            torch.clamp(prog_best.unsqueeze(0), -5.0, 5.0),
-            torch.clamp(prog_median.unsqueeze(0), -5.0, 5.0),
-            torch.clamp(div_t.unsqueeze(0) / 100.0, 0.0, 5.0),
-            torch.clamp(div_change.unsqueeze(0), -1.0, 1.0),
-            stag_ratio.unsqueeze(0),
-            skewness.unsqueeze(0) / 5.0,
-            entropy.unsqueeze(0),
-            torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),
-            last_action.flatten(),  # 6维直接展平加入
-            feedback_stats  # 4维：[intervene_ratio, accept_ratio, rescue_success, elite_damage]
-        ], dim=0)
-
-        return state.unsqueeze(0)  # [1, 18]
-
-==================================================
-
-// [MODULE] File: rlec\features\stage_reward.py
-----------------------------------------
 import torch
 
 
@@ -942,6 +589,10 @@ class StageRewardCalculator:
         r_q20 = torch.log1p(torch.relu(q20_start - q20_end)) / (torch.log1p(torch.abs(q20_start)) + 1e-8)
 
         r_perf = 2.0 * r_best.item() + 0.5 * r_median.item() + 1.0 * r_q20.item()
+        # Precision reward: keep pushing in ultra-low error regime.
+        best_end_safe = torch.clamp(best_end, min=0.0)
+        r_precision = 0.02 * (-torch.log(best_end_safe + 1e-12)).item()
+        r_precision = min(r_precision, 0.8)
 
         # B. 控制效果项 (Control Credit Assignment)
         # e/x/b 的约束：如果干预了很多，但没被接受，则惩罚；被接受了就奖励
@@ -960,257 +611,13 @@ class StageRewardCalculator:
         # mild action regularization: avoid extreme exploration-exploitation imbalance.
         action = torch.clamp(action, 0.0, 1.0)
         e_t, x_t, _, b_t, _, _ = action.tolist()
-        r_balance = -0.1 * abs(e_t - x_t)
+        r_balance = -0.02 * abs(e_t - x_t)
         r_budget_safety = -0.05 * max(0.0, b_t - 0.8)
         # Encourage "settling down" when stage already reaches a compact basin.
         compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
-        r_late_settle = (-0.4 * e_t - 0.3 * b_t) if compact_basin else 0.0
+        r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
 
         r_ctrl = r_efficiency + r_rescue + r_elite_stab + r_div_overshoot + r_stag + r_balance + r_budget_safety + r_late_settle
 
-        total_reward = r_perf + r_ctrl
+        total_reward = r_perf + r_ctrl + r_precision
         return total_reward
-
-
-==================================================
-
-// [MODULE] File: rlec\rl\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\rl\networks.py
-----------------------------------------
-import torch
-import torch.nn as nn
-from torch.distributions import Normal
-
-
-class ActorMLP(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 32):  # 降至 32
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim)  # 去掉第二层隐藏层，加速拟合
-        )
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
-
-    def forward(self, state):
-        mean = self.net(state)
-        std = self.log_std.exp().expand_as(mean)
-        return Normal(mean, std)
-
-class CriticMLP(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, state):
-        return self.net(state)
-
-==================================================
-
-// [MODULE] File: rlec\rl\ppo.py
-----------------------------------------
-import torch
-import torch.nn as nn
-import numpy as np
-from .networks import ActorMLP, CriticMLP
-from .rollout_buffer import RolloutBuffer
-
-
-class PPO:
-    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
-                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.15,
-                 entropy_coef=0.002, k_epochs=2):
-        self.device = device
-        self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.k_epochs = k_epochs
-
-        self.actor = ActorMLP(state_dim, action_dim).to(device)
-        self.critic = CriticMLP(state_dim).to(device)
-
-        self.optimizer = torch.optim.Adam([
-            {'params': self.actor.parameters(), 'lr': lr_actor},
-            {'params': self.critic.parameters(), 'lr': lr_critic}
-        ])
-        self.buffer = RolloutBuffer(device)
-
-    def select_action(self, state: torch.Tensor, deterministic=False):
-        with torch.no_grad():
-            if state.dim() == 1:
-                state = state.unsqueeze(0)
-
-            dist = self.actor(state)
-            value = self.critic(state)
-            action_delta = dist.mean if deterministic else dist.sample()
-            log_prob = dist.log_prob(action_delta).sum(dim=-1)
-
-            # 动作平滑与安全先验 (Safe Prior)
-            # a_safe: [e=0.3, x=0.5, d=0.5, b=0.2, r=0.1, p=0.8] 提供稳健初始形态
-            a_safe = torch.tensor([0.3, 0.5, 0.5, 0.2, 0.1, 0.8], device=self.device)
-            epsilon = 0.2  # 最大允许网络偏离安全值的范围
-
-            # 使用 tanh 把网络输出压到 [-1, 1]，然后映射到微调区间
-            delta_scaled = torch.tanh(action_delta) * epsilon
-            intent_action = torch.clamp(a_safe + delta_scaled, 0.0, 1.0)
-
-        return (
-            action_delta.squeeze(0).cpu().numpy(),
-            intent_action.squeeze(0).cpu().numpy(),
-            log_prob.squeeze(0).item(),
-            value.squeeze(0).item()
-        )
-
-    def update(self):
-        if len(self.buffer.states) == 0: return {}
-
-        states = torch.stack(self.buffer.states).to(self.device)
-        actions = torch.stack(self.buffer.actions).to(self.device)
-        old_log_probs = torch.tensor(self.buffer.log_probs, device=self.device)
-
-        with torch.no_grad():
-            next_value = self.critic(states[-1:]).item()
-
-        returns, advantages = self.buffer.compute_gae(next_value, self.gamma)
-        actor_loss_list, critic_loss_list = [], []
-
-        for _ in range(self.k_epochs):
-            dist = self.actor(states)
-            log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-
-            ratios = torch.exp(log_probs - old_log_probs)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
-            values = self.critic(states).reshape(-1)
-            returns = returns.reshape(-1)
-            critic_loss = nn.MSELoss()(values, returns)
-
-            loss = actor_loss + 0.5 * critic_loss
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-            self.optimizer.step()
-
-            actor_loss_list.append(actor_loss.item())
-            critic_loss_list.append(critic_loss.item())
-
-        self.buffer.clear()
-        return {"actor_loss": np.mean(actor_loss_list), "critic_loss": np.mean(critic_loss_list)}
-
-==================================================
-
-// [MODULE] File: rlec\rl\rollout_buffer.py
-----------------------------------------
-import torch
-
-class RolloutBuffer:
-    """PPO 专用的 On-policy 轨迹缓冲池"""
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.clear()
-
-    def clear(self):
-        self.states, self.actions, self.rewards = [], [], []
-        self.values, self.log_probs, self.dones = [], [], []
-
-    def add(self, state, action, reward, value, log_prob, done):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-        self.dones.append(done)
-
-    def compute_gae(self, next_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
-        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
-        values = torch.tensor(self.values + [next_value], dtype=torch.float32, device=self.device)
-        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
-
-        advantages = torch.zeros(len(rewards), dtype=torch.float32, device=self.device)
-        last_gae = 0.0
-
-        for t in reversed(range(len(rewards))):
-            mask = 1.0 - dones[t]
-            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
-            advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
-
-        returns = advantages + values[:-1]
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return returns, advantages
-
-==================================================
-
-// [MODULE] File: rlec\utils\__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec\utils\population_metrics.py
-----------------------------------------
-import torch
-
-
-def compute_diversity(pop: torch.Tensor) -> torch.Tensor:
-    return torch.std(pop, dim=0).mean()
-
-
-def compute_fitness_skewness(fit: torch.Tensor) -> torch.Tensor:
-    mean = fit.mean()
-    std = fit.std() + 1e-8
-    skewness = torch.mean(((fit - mean) / std) ** 3)
-    return torch.clamp(skewness, -5.0, 5.0)
-
-
-def compute_rank_entropy(fit: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    norm_fit = (fit - fit.mean()) / (fit.std() + 1e-8)
-    probs = torch.softmax(-norm_fit / temperature, dim=0)
-    entropy = -(probs * torch.log(probs + 1e-8)).sum()
-    max_entropy = torch.log(torch.tensor(float(fit.shape[0]), device=fit.device))
-    return entropy / max_entropy
-
-
-def compute_stagnation_ratio(stagnation: torch.Tensor, threshold: int = 10) -> torch.Tensor:
-    stagnant_count = (stagnation >= threshold).sum().float()
-    return stagnant_count / stagnation.shape[0]
-
-
-# 【必须改 4】：新增聚类分离度特征，识别种群是否塌缩为单峰
-def compute_elite_separation(pop: torch.Tensor, fit: torch.Tensor, q: float = 0.1) -> torch.Tensor:
-    """计算精英簇与其他个体之间的分离度 (分离度越高，说明盆地越多/结构越清晰)"""
-    N = pop.shape[0]
-    k = max(1, int(N * q))
-
-    _, indices = torch.sort(fit)
-    elite_idx = indices[:k]
-    non_elite_idx = indices[k:]
-
-    elite_pop = pop[elite_idx]
-    non_elite_pop = pop[non_elite_idx]
-
-    # 找到精英簇的中心点
-    elite_center = elite_pop.mean(dim=0)
-
-    # 精英簇内部的紧凑度
-    elite_spread = torch.norm(elite_pop - elite_center, dim=1).mean()
-    # 大众个体离精英中心的平均距离
-    separation = torch.norm(non_elite_pop - elite_center, dim=1).mean()
-
-    # 比例越大，说明种群不仅有精英，还有大量个体在远方探索 (多模态结构)
-    return separation / (elite_spread + 1e-8)
-
-==================================================
-

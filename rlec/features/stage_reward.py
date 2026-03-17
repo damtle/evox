@@ -28,6 +28,10 @@ class StageRewardCalculator:
         r_q20 = torch.log1p(torch.relu(q20_start - q20_end)) / (torch.log1p(torch.abs(q20_start)) + 1e-8)
 
         r_perf = 2.0 * r_best.item() + 0.5 * r_median.item() + 1.0 * r_q20.item()
+        # Precision reward: keep pushing in ultra-low error regime.
+        best_end_safe = torch.clamp(best_end, min=0.0)
+        r_precision = 0.02 * (-torch.log(best_end_safe + 1e-12)).item()
+        r_precision = min(r_precision, 0.8)
 
         # B. 控制效果项 (Control Credit Assignment)
         # e/x/b 的约束：如果干预了很多，但没被接受，则惩罚；被接受了就奖励
@@ -54,5 +58,5 @@ class StageRewardCalculator:
 
         r_ctrl = r_efficiency + r_rescue + r_elite_stab + r_div_overshoot + r_stag + r_balance + r_budget_safety + r_late_settle
 
-        total_reward = r_perf + r_ctrl
+        total_reward = r_perf + r_ctrl + r_precision
         return total_reward

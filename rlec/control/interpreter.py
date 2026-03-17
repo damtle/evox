@@ -83,7 +83,8 @@ class ControlInterpreter:
         alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
         beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
 
-        target_diversity = initial_div * (0.1 + 0.9 * intent.d_t)
+        # Allow true convergence to near-zero diversity in refinement stage.
+        target_diversity = initial_div * intent.d_t
 
         return EACommand(
             protected_mask=protected_mask,

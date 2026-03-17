@@ -8,6 +8,7 @@ from rlec.features.macro_state import MacroStateBuilder
 from rlec.features.stage_reward import StageRewardCalculator
 from rlec.control.intent_vector import IntentVector
 from rlec.control.interpreter import ControlInterpreter
+from rlec.control.niche_manager import NicheManager
 from rlec.rl.ppo import PPO
 from rlec.utils.population_metrics import compute_diversity
 
@@ -38,6 +39,7 @@ class RLECWrapper(Algorithm):
         self.state_builder = MacroStateBuilder(self.dim, self.pop_size)
         self.reward_calc = StageRewardCalculator()
         self.interpreter = ControlInterpreter(self.pop_size)
+        self.niche_manager = NicheManager(self.pop_size, self.dim, self.device)
 
         # 鍒濆鍖?PPO 澶ц剳 (鐘舵€佺淮搴?12锛屽姩浣滅淮搴?6)
         self.rl_agent = PPO(
@@ -83,6 +85,8 @@ class RLECWrapper(Algorithm):
         self.current_cmd_middle = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_quiet = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_target_div = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_niche_guardian = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_converged = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_gate_refine = Mutable(torch.tensor(0.0, device=self.device))
         self.current_gate_recover = Mutable(torch.tensor(0.0, device=self.device))
         self.last_intent_eff = Mutable(torch.zeros(6, device=self.device))
@@ -216,6 +220,7 @@ class RLECWrapper(Algorithm):
         p_eff = torch.clamp(intent_tensor[5] + 0.30 * g_refine * (1.0 - intent_tensor[5]), 0.0, 1.0)
 
         intent_eff_tensor = torch.stack([e_eff, x_eff, d_eff, b_eff, r_eff, p_eff]).to(self.device)
+
         intent_eff_obj = IntentVector.from_tensor(intent_eff_tensor)
 
         self.current_gate_refine = g_refine.detach()
@@ -238,6 +243,50 @@ class RLECWrapper(Algorithm):
         self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
         self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
         self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
+
+        # Niche-level lifecycle plan: classify subpopulations and allocate release/rescue budgets.
+        niche_plan = self.niche_manager.plan(
+            pop=current_pop,
+            fit=current_fit,
+            stage_start_pop=self.stage_start_pop,
+            stage_start_fit=self.stage_start_fit,
+            stage_start_stagnation=self.stage_start_stagnation,
+            stagnation=self.stagnation,
+            intent_eff=intent_eff_tensor,
+            initial_div=float(self.initial_div.item()),
+        )
+        self.current_niche_guardian = niche_plan.guardian_mask
+        self.current_niche_converged = niche_plan.converged_mask
+        self.current_cmd_protected = self.current_cmd_protected | niche_plan.guardian_mask
+        self.current_cmd_quiet = self.current_cmd_quiet | niche_plan.guardian_mask
+        self.current_cmd_middle = self.current_cmd_middle & (niche_plan.exploring_mask | niche_plan.refining_mask) & (~niche_plan.guardian_mask)
+        self.current_cmd_rescue = self.current_cmd_rescue & niche_plan.rescue_mask & niche_plan.exploring_mask & (~niche_plan.guardian_mask)
+        # Niche-aware scale correction after role slicing.
+        self.current_cmd_scales[niche_plan.refining_mask] = self.current_cmd_scales[niche_plan.refining_mask] * 0.6
+        self.current_cmd_scales[niche_plan.converged_mask & (~niche_plan.guardian_mask)] = 0.0
+
+        release_idx = torch.where(niche_plan.release_mask)[0]
+        if release_idx.numel() > 0:
+            new_pos = self.niche_manager.sample_release_positions(
+                int(release_idx.numel()),
+                self.lb,
+                self.ub,
+                avoid_centers=niche_plan.active_centers,
+            )
+            self.base.pop[release_idx] = new_pos
+            self.base.fit[release_idx] = self.evaluate(new_pos)
+            self.stagnation[release_idx] = 0.0
+            self.prev_pop[release_idx] = self.base.pop[release_idx]
+            self.prev_fit[release_idx] = self.base.fit[release_idx]
+            # Clear stale lifecycle labels from released particles immediately.
+            self.current_niche_converged[release_idx] = False
+            self.current_niche_guardian[release_idx] = False
+            self.current_cmd_quiet[release_idx] = False
+            self.current_cmd_protected[release_idx] = False
+            self.current_cmd_rescue[release_idx] = False
+            self.current_cmd_middle[release_idx] = False
+            self.current_cmd_scales[release_idx] = 1.0
+            current_div = compute_diversity(self.base.pop)
 
         # Sync any potential interpreter-side normalized clipping back to effective action.
         intent_eff_tensor = torch.tensor(
@@ -320,6 +369,12 @@ class RLECWrapper(Algorithm):
         curr_pop = self.base.pop.clone()
         curr_fit = self.base.fit.clone()
 
+        # Guardian hard-freeze (stable first version).
+        guardian_mask = self.current_niche_guardian
+        if guardian_mask.any():
+            curr_pop[guardian_mask] = self.prev_pop[guardian_mask]
+            curr_fit[guardian_mask] = self.prev_fit[guardian_mask]
+
         # 璁＄畻灞€閮ㄥ昂搴﹂敋鐐?
         pop_std = torch.std(curr_pop, dim=0) + 1e-8
         trial_pop = curr_pop.clone()
@@ -339,6 +394,9 @@ class RLECWrapper(Algorithm):
         if middle_mask.any() and intent.e_t > 0.01:
             mid_scales = self.current_cmd_scales[middle_mask].unsqueeze(1)
             noise = torch.randn_like(trial_pop[middle_mask]) * pop_std * intent.e_t * mid_scales
+            # Ignore numerically tiny perturbations in late fine-search.
+            small_noise = torch.norm(noise, dim=1, keepdim=True) < 1e-6
+            noise = torch.where(small_noise, torch.zeros_like(noise), noise)
             trial_pop[middle_mask] += noise
 
         # 2. 寮€鍙戞媺鎷?(x)
