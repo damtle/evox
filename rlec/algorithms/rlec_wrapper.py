@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 import torch
 
 from evox.core import Algorithm, Mutable
@@ -14,15 +14,15 @@ from rlec.utils.population_metrics import compute_diversity
 
 class RLECWrapper(Algorithm):
     """
-    RLEC 强化学习进化阶段控制器
-    将底层 EA 视为战术执行层，RL 视为战略调度层。
+    RLEC 寮哄寲瀛︿範杩涘寲闃舵鎺у埗鍣?
+    灏嗗簳灞?EA 瑙嗕负鎴樻湳鎵ц灞傦紝RL 瑙嗕负鎴樼暐璋冨害灞傘€?
     """
 
     def __init__(
             self,
             base_algo: Algorithm,
-            stage_length: int = 10,  # K 代为一个决策周期
-            update_stages: int = 2,  # 收集多少个阶段的数据更新一次 PPO
+            stage_length: int = 10,  # K 浠ｄ负涓€涓喅绛栧懆鏈?
+            update_stages: int = 2,  # 鏀堕泦澶氬皯涓樁娈电殑鏁版嵁鏇存柊涓€娆?PPO
             device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -34,12 +34,12 @@ class RLECWrapper(Algorithm):
         pop_shape = base_algo.pop.shape
         self.pop_size, self.dim = pop_shape[0], pop_shape[1]
 
-        # 初始化三大件：雷达、评分、翻译官
+        # 鍒濆鍖栦笁澶т欢锛氶浄杈俱€佽瘎鍒嗐€佺炕璇戝畼
         self.state_builder = MacroStateBuilder(self.dim, self.pop_size)
         self.reward_calc = StageRewardCalculator()
         self.interpreter = ControlInterpreter(self.pop_size)
 
-        # 初始化 PPO 大脑 (状态维度 12，动作维度 6)
+        # 鍒濆鍖?PPO 澶ц剳 (鐘舵€佺淮搴?12锛屽姩浣滅淮搴?6)
         self.rl_agent = PPO(
             state_dim=self.state_builder.state_dim,
             action_dim=6,
@@ -51,21 +51,21 @@ class RLECWrapper(Algorithm):
 
         self.current_cmd_scales = Mutable(torch.ones(self.pop_size, device=self.device))
 
-        # ================= 时序追踪状态 =================
+        # ================= 鏃跺簭杩借釜鐘舵€?=================
         self.step_counter = Mutable(torch.tensor(0, device=self.device))
         self.stagnation = Mutable(torch.zeros(self.pop_size, device=self.device))
 
-        # 记录上一代的种群 (用于算提升和更新 stagnation)
+        # 璁板綍涓婁竴浠ｇ殑绉嶇兢 (鐢ㄤ簬绠楁彁鍗囧拰鏇存柊 stagnation)
         self.prev_pop = Mutable(base_algo.pop.clone())
         self.prev_fit = Mutable(torch.full_like(base_algo.fit, torch.inf))
 
-        # 记录“阶段初”的种群，用于在 K 代结束后算总账
+        # 璁板綍鈥滈樁娈靛垵鈥濈殑绉嶇兢锛岀敤浜庡湪 K 浠ｇ粨鏉熷悗绠楁€昏处
         self.stage_start_pop = Mutable(base_algo.pop.clone())
         self.stage_start_fit = Mutable(torch.full_like(base_algo.fit, torch.inf))
         self.stage_start_div = Mutable(torch.tensor(0.0, device=self.device))
         self.stage_start_stagnation = Mutable(torch.zeros(self.pop_size, device=self.device))
 
-        # ================= RL 记忆追踪 =================
+        # ================= RL 璁板繂杩借釜 =================
         self.hidden_a = Mutable(torch.zeros(1, 1, 64, device=self.device))
         self.hidden_c = Mutable(torch.zeros(1, 1, 64, device=self.device))
         self.last_state = Mutable(torch.zeros(1, self.state_builder.state_dim, device=self.device))
@@ -75,26 +75,29 @@ class RLECWrapper(Algorithm):
         self.last_value = Mutable(torch.tensor(0.0, device=self.device))
         self.last_roi = Mutable(torch.tensor(0.0, device=self.device))
 
-        # ================= 战术指令缓存 =================
-        # 用于存放当前 K 代中，底层 EA 必须服从的指令
+        # ================= 鎴樻湳鎸囦护缂撳瓨 =================
+        # 鐢ㄤ簬瀛樻斁褰撳墠 K 浠ｄ腑锛屽簳灞?EA 蹇呴』鏈嶄粠鐨勬寚浠?
         self.current_cmd_protected = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_rescue = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
-        # 【新增】：必须缓存解释器计算好的 middle_mask，不要自己重算！
+        # 銆愭柊澧炪€戯細蹇呴』缂撳瓨瑙ｉ噴鍣ㄨ绠楀ソ鐨?middle_mask锛屼笉瑕佽嚜宸遍噸绠楋紒
         self.current_cmd_middle = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_cmd_quiet = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_target_div = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_refinement_mode = Mutable(torch.tensor(False, dtype=torch.bool, device=self.device))
+        self.current_rescue_strength = Mutable(torch.tensor(1.0, device=self.device))
 
-        # 包装器自己维护的最优记录
+        # 鍖呰鍣ㄨ嚜宸辩淮鎶ょ殑鏈€浼樿褰?
         self.global_best_fit = Mutable(torch.tensor(torch.inf, device=self.device))
         self.global_best_location = Mutable(torch.zeros(self.dim, device=self.device))
 
-        # 在 __init__ 中新增执行反馈的 Mutable 追踪变量
+        # 鍦?__init__ 涓柊澧炴墽琛屽弽棣堢殑 Mutable 杩借釜鍙橀噺
         self.last_intervene_ratio = Mutable(torch.tensor(0.0, device=self.device))
         self.last_accept_ratio = Mutable(torch.tensor(0.0, device=self.device))
         self.last_rescue_success = Mutable(torch.tensor(0.0, device=self.device))
         self.last_elite_damage = Mutable(torch.tensor(0.0, device=self.device))
 
 
-    # [此处暴露 pop, fit 等属性，保持与 EVOX 的兼容性]
+    # [姝ゅ鏆撮湶 pop, fit 绛夊睘鎬э紝淇濇寔涓?EVOX 鐨勫吋瀹规€
     @property
     def pop(self):
         return self.base.pop
@@ -134,17 +137,17 @@ class RLECWrapper(Algorithm):
         self.global_best_fit = best_val.clone()
         self.global_best_location = self.base.pop[best_idx].clone()
 
-        # 初始化时触发第 0 次调度
+        # 鍒濆鍖栨椂瑙﹀彂绗?0 娆¤皟搴?
         self.initial_div = compute_diversity(self.base.pop)
         self._dispatch_new_stage()
 
     def _dispatch_new_stage(self):
-        """司令部下达新阶段指令"""
+        """鍙镐护閮ㄤ笅杈炬柊闃舵鎸囦护"""
         current_pop = self.base.pop
         current_fit = self.base.fit
         current_div = compute_diversity(current_pop)
 
-        # 1. 提取 12 维宏观态势雷达图
+        # 1. 鎻愬彇 12 缁村畯瑙傛€佸娍闆疯揪鍥?
         state = self.state_builder.build(
             pop_t=current_pop, fit_t=current_fit,
             pop_t_minus_k=self.stage_start_pop, fit_t_minus_k=self.stage_start_fit,
@@ -158,7 +161,7 @@ class RLECWrapper(Algorithm):
             ]).to(self.device)
         )
 
-        # 2. PPO-LSTM 大脑思考，生成新指令
+        # 2. PPO-LSTM 澶ц剳鎬濊€冿紝鐢熸垚鏂版寚浠?
         # state: [1, 12]
         action_raw, intent_np, log_prob, value = self.rl_agent.select_action(
             state, deterministic=False
@@ -166,7 +169,7 @@ class RLECWrapper(Algorithm):
 
         self.last_state = state.clone()
 
-        # 3. 翻译官翻译指令
+        # 3. 缈昏瘧瀹樼炕璇戞寚浠?
         intent_tensor = torch.tensor(intent_np, device=self.device, dtype=torch.float32)
         intent_obj = IntentVector.from_tensor(intent_tensor)
 
@@ -177,21 +180,47 @@ class RLECWrapper(Algorithm):
         stage_best_now = torch.min(current_fit)
         stage_progress = (stage_best_start - stage_best_now) / (torch.abs(stage_best_start) + 1e-8)
         div_ratio = current_div / (self.initial_div + 1e-8)
-        if stage_progress.item() < 1e-4 and div_ratio.item() < 0.15:
+        best_now = torch.min(current_fit)
+        median_now = torch.median(current_fit)
+        spread_ratio = (median_now - best_now) / (torch.abs(best_now) + 1e-8)
+        stag_ratio = torch.mean((self.stagnation >= 10).float())
+
+        # Refinement mode: convergence in a compact basin, reduce interference.
+        is_refinement_mode = bool(
+            (div_ratio.item() < 0.08 and spread_ratio.item() < 0.15 and stag_ratio.item() > 0.3)
+            or (stage_progress.item() < 1e-5 and spread_ratio.item() < 0.08 and div_ratio.item() < 0.12)
+        )
+
+        if is_refinement_mode:
             intent_obj = IntentVector(
-                e_t=max(intent_obj.e_t, 0.65),
-                x_t=min(intent_obj.x_t, 0.45),
-                d_t=max(intent_obj.d_t, 0.60),
-                b_t=max(intent_obj.b_t, 0.35),
-                r_t=max(intent_obj.r_t, 0.25),
-                p_t=max(intent_obj.p_t, 0.80),
+                e_t=min(intent_obj.e_t, 0.05),
+                x_t=max(intent_obj.x_t, 0.75),
+                d_t=min(intent_obj.d_t, 0.20),
+                b_t=min(intent_obj.b_t, 0.08),
+                r_t=min(intent_obj.r_t, 0.03),
+                p_t=max(intent_obj.p_t, 0.95),
             )
-            intent_tensor = torch.tensor(
-                [intent_obj.e_t, intent_obj.x_t, intent_obj.d_t, intent_obj.b_t, intent_obj.r_t, intent_obj.p_t],
-                device=self.device,
-                dtype=torch.float32,
-            )
-        # 传入 initial_div
+            self.current_refinement_mode = torch.tensor(True, dtype=torch.bool, device=self.device)
+            self.current_rescue_strength = torch.tensor(0.30, device=self.device)
+        else:
+            # Weak-EA fallback: no progress + collapse but not a tight-quality basin.
+            if stage_progress.item() < 1e-4 and div_ratio.item() < 0.15 and spread_ratio.item() > 0.20:
+                intent_obj = IntentVector(
+                    e_t=max(intent_obj.e_t, 0.65),
+                    x_t=min(intent_obj.x_t, 0.45),
+                    d_t=max(intent_obj.d_t, 0.60),
+                    b_t=max(intent_obj.b_t, 0.35),
+                    r_t=max(intent_obj.r_t, 0.25),
+                    p_t=max(intent_obj.p_t, 0.80),
+                )
+            self.current_refinement_mode = torch.tensor(False, dtype=torch.bool, device=self.device)
+            self.current_rescue_strength = torch.tensor(1.0, device=self.device)
+
+        intent_tensor = torch.tensor(
+            [intent_obj.e_t, intent_obj.x_t, intent_obj.d_t, intent_obj.b_t, intent_obj.r_t, intent_obj.p_t],
+            device=self.device,
+            dtype=torch.float32,
+        )
         cmd = self.interpreter.interpret(intent_obj, current_fit, self.stagnation, self.initial_div.item())
 
         self.last_action_raw = torch.tensor(action_raw, device=self.device)
@@ -201,24 +230,25 @@ class RLECWrapper(Algorithm):
 
         self.current_cmd_protected = cmd.protected_mask
         self.current_cmd_middle = cmd.middle_mask
+        self.current_cmd_quiet = cmd.quiet_mask
         self.current_cmd_rescue = cmd.rescue_mask
         self.current_cmd_scales = cmd.step_scales.clone()
-        # 记录双容忍度
+        # 璁板綍鍙屽蹇嶅害
         self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
         self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
         self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
 
-        # # 5. 【硬核战术动作：破局救援】
-        # # 在阶段初，对被标记为 rescue 的粒子施加无视物理规律的随机传送！
+        # # 5. 銆愮‖鏍告垬鏈姩浣滐細鐮村眬鏁戞彺銆?
+        # # 鍦ㄩ樁娈靛垵锛屽琚爣璁颁负 rescue 鐨勭矑瀛愭柦鍔犳棤瑙嗙墿鐞嗚寰嬬殑闅忔満浼犻€侊紒
         # rescue_idx = torch.where(cmd.rescue_mask)[0]
         # if len(rescue_idx) > 0:
         #     new_pos = self.lb + torch.rand(len(rescue_idx), self.dim, device=self.device) * (self.ub - self.lb)
         #     self.base.pop[rescue_idx] = new_pos
         #     self.base.fit[rescue_idx] = self.evaluate(new_pos)
-        #     # 重新计算救援后的真实多样性
+        #     # 閲嶆柊璁＄畻鏁戞彺鍚庣殑鐪熷疄澶氭牱鎬?
         #     current_div = compute_diversity(self.base.pop)
 
-        # 6. 更新新阶段的起点锚点 (此时种群已经是救援后的干净状态了)
+        # 6. 鏇存柊鏂伴樁娈电殑璧风偣閿氱偣 (姝ゆ椂绉嶇兢宸茬粡鏄晳鎻村悗鐨勫共鍑€鐘舵€佷簡)
         self.stage_start_pop = self.base.pop.clone()
         self.stage_start_fit = self.base.fit.clone()
         self.stage_start_div = current_div
@@ -228,16 +258,16 @@ class RLECWrapper(Algorithm):
         step_val = int(self.step_counter.item())
 
         # =====================================================================
-        # 第一阶段：清算上一阶段奖励，并下达新阶段指令 (每 K 代触发一次)
+        # 绗竴闃舵锛氭竻绠椾笂涓€闃舵濂栧姳锛屽苟涓嬭揪鏂伴樁娈垫寚浠?(姣?K 浠ｈЕ鍙戜竴娆?
         # =====================================================================
         if step_val > 0 and step_val % self.K == 0:
             current_div = compute_diversity(self.base.pop)
 
-            # 1. 结算这个周期的总账 (K代奖励)
+            # 1. 缁撶畻杩欎釜鍛ㄦ湡鐨勬€昏处 (K浠ｅ鍔?
             stag_ratio_start = (self.stage_start_stagnation >= 10).sum().float() / self.pop_size
             stag_ratio_end = (self.stagnation >= 10).sum().float() / self.pop_size
 
-            # 【新增】：将收集到的执行反馈打包传给奖励函数
+            # 銆愭柊澧炪€戯細灏嗘敹闆嗗埌鐨勬墽琛屽弽棣堟墦鍖呬紶缁欏鍔卞嚱鏁?
             feedbacks = torch.stack([
                 self.last_intervene_ratio,
                 self.last_accept_ratio,
@@ -245,7 +275,7 @@ class RLECWrapper(Algorithm):
                 self.last_elite_damage
             ]).to(self.device)
 
-            # 【修改】：只接收 reward（剥离 ROI），并补齐 feedbacks 参数
+            # 銆愪慨鏀广€戯細鍙帴鏀?reward锛堝墺绂?ROI锛夛紝骞惰ˉ榻?feedbacks 鍙傛暟
             reward = self.reward_calc.calculate(
                 fit_start=self.stage_start_fit, fit_end=self.base.fit,
                 div_start=self.stage_start_div.item(), div_end=current_div.item(),
@@ -263,52 +293,59 @@ class RLECWrapper(Algorithm):
                 log_prob=self.last_logprob.item(), done=0.0
             )
 
-            # 3. 如果攒够了阶段数，通知 PPO 进行反向传播更新大脑
+            # 3. 濡傛灉鏀掑浜嗛樁娈垫暟锛岄€氱煡 PPO 杩涜鍙嶅悜浼犳挱鏇存柊澶ц剳
             if len(self.rl_agent.buffer.states) >= self.update_stages:
                 self.rl_agent.update()
 
-            # 4. 发布新一阶段的控制意图
+            # 4. 鍙戝竷鏂颁竴闃舵鐨勬帶鍒舵剰鍥?
             self._dispatch_new_stage()
 
         # =====================================================================
-        # 第二阶段：底层战术执行 (弱耦合残差控制)
+        # 绗簩闃舵锛氬簳灞傛垬鏈墽琛?(寮辫€﹀悎娈嬪樊鎺у埗)
         # =====================================================================
         self.base.step()
 
         curr_pop = self.base.pop.clone()
         curr_fit = self.base.fit.clone()
 
-        # 计算局部尺度锚点
+        # 璁＄畻灞€閮ㄥ昂搴﹂敋鐐?
         pop_std = torch.std(curr_pop, dim=0) + 1e-8
         trial_pop = curr_pop.clone()
 
         intent = IntentVector.from_tensor(self.last_intent)
         middle_mask = self.current_cmd_middle
         rescue_mask = self.current_cmd_rescue
+        quiet_mask = self.current_cmd_quiet
+        refinement_mode = bool(self.current_refinement_mode.item())
 
-        # 1. 探索扰动 (e)
+        # Keep good stagnation particles quiet in refinement mode.
+        if refinement_mode:
+            middle_mask = middle_mask & (~quiet_mask)
+            rescue_mask = rescue_mask & (~quiet_mask)
+
+        # 1. 鎺㈢储鎵板姩 (e)
         if middle_mask.any() and intent.e_t > 0.01:
             mid_scales = self.current_cmd_scales[middle_mask].unsqueeze(1)
             noise = torch.randn_like(trial_pop[middle_mask]) * pop_std * intent.e_t * mid_scales
             trial_pop[middle_mask] += noise
 
-        # 2. 开发拉拽 (x)
+        # 2. 寮€鍙戞媺鎷?(x)
         if middle_mask.any() and intent.x_t > 0.01:
             dir_to_best = self.global_best_location - trial_pop[middle_mask]
             mid_scales = self.current_cmd_scales[middle_mask].unsqueeze(1)
             pull = torch.rand(middle_mask.sum().item(), 1, device=self.device) * intent.x_t * mid_scales
             trial_pop[middle_mask] += dir_to_best * pull
 
-        # 3. 停滞救援 (r) - 信赖域式恢复
+        # 3. 鍋滄粸鏁戞彺 (r) - 淇¤禆鍩熷紡鎭㈠
         if rescue_mask.any():
             rescue_scales = self.current_cmd_scales[rescue_mask].unsqueeze(1)
             trial_pop[rescue_mask] = self.global_best_location + torch.randn_like(
-                trial_pop[rescue_mask]) * pop_std * 2.0 * rescue_scales
+                trial_pop[rescue_mask]) * pop_std * 2.0 * self.current_rescue_strength * rescue_scales
 
         trial_pop = clamp(trial_pop, self.lb, self.ub)
 
         # =====================================================================
-        # 第三阶段：贪心保底验收与反馈收集
+        # 绗笁闃舵锛氳椽蹇冧繚搴曢獙鏀朵笌鍙嶉鏀堕泦
         # =====================================================================
         modified_mask = middle_mask | rescue_mask
         n_mod = modified_mask.sum().float()
@@ -317,16 +354,19 @@ class RLECWrapper(Algorithm):
             trial_fit = curr_fit.clone()
             trial_fit[modified_mask] = self.evaluate(trial_pop[modified_mask])
 
-            # 纯贪心：只要比 EA 自己走的一步好，就接受
+            # 绾椽蹇冿細鍙姣?EA 鑷繁璧扮殑涓€姝ュソ锛屽氨鎺ュ彈
             strict_accept = trial_fit < curr_fit
             margin_fit = curr_fit + torch.abs(curr_fit) * self.current_cmd_alpha_margin + self.current_cmd_beta_margin
             soft_accept = trial_fit < margin_fit
-            accept_mask = strict_accept | (rescue_mask & soft_accept)
+            if refinement_mode:
+                accept_mask = strict_accept
+            else:
+                accept_mask = strict_accept | (rescue_mask & soft_accept)
 
             curr_pop[accept_mask] = trial_pop[accept_mask]
             curr_fit[accept_mask] = trial_fit[accept_mask]
 
-            # 收集控制执行反馈 (供下一阶段 State 和 Reward 使用)
+            # 鏀堕泦鎺у埗鎵ц鍙嶉 (渚涗笅涓€闃舵 State 鍜?Reward 浣跨敤)
             self.last_intervene_ratio = n_mod / self.pop_size
             self.last_accept_ratio = accept_mask.sum().float() / n_mod
             if rescue_mask.any():
@@ -339,14 +379,14 @@ class RLECWrapper(Algorithm):
             self.last_accept_ratio = torch.tensor(0.0, device=self.device)
             self.last_rescue_success = torch.tensor(0.0, device=self.device)
 
-        # 【新增】：重新定义 Elite Damage。审查底层 EA 是否破坏了精英！
+        # 銆愭柊澧炪€戯細閲嶆柊瀹氫箟 Elite Damage銆傚鏌ュ簳灞?EA 鏄惁鐮村潖浜嗙簿鑻憋紒
         protected_mask = self.current_cmd_protected
         if protected_mask.any():
-            # 统计在 base.step() 之后变差的精英群体
+            # 缁熻鍦?base.step() 涔嬪悗鍙樺樊鐨勭簿鑻辩兢浣?
             worsened = (curr_fit > self.prev_fit) & protected_mask
             self.last_elite_damage = worsened.sum().float() / protected_mask.sum().float()
 
-            # 既然叫“保护”，我们就贯彻到底：把变差的精英直接回滚到上一代！
+            # 鏃㈢劧鍙€滀繚鎶も€濓紝鎴戜滑灏辫疮褰诲埌搴曪細鎶婂彉宸殑绮捐嫳鐩存帴鍥炴粴鍒颁笂涓€浠ｏ紒
             curr_pop[worsened] = self.prev_pop[worsened]
             curr_fit[worsened] = self.prev_fit[worsened]
         else:
@@ -356,7 +396,7 @@ class RLECWrapper(Algorithm):
         self.base.fit = curr_fit
 
         # =====================================================================
-        # 收尾状态更新
+        # 鏀跺熬鐘舵€佹洿鏂?
         # =====================================================================
         improved = curr_fit < self.prev_fit
         self.stagnation = torch.where(improved, torch.zeros_like(self.stagnation), self.stagnation + 1)
@@ -369,7 +409,7 @@ class RLECWrapper(Algorithm):
             self.global_best_fit = current_best_val.clone()
             self.global_best_location = self.base.pop[current_best_idx].clone()
 
-        # 兼容性同步
+        # 鍏煎鎬у悓姝?
         if hasattr(self.base, 'global_best_fit'):
             self.base.global_best_fit = self.global_best_fit.clone()
             self.base.global_best_location = self.global_best_location.clone()
