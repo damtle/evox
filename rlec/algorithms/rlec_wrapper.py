@@ -83,8 +83,9 @@ class RLECWrapper(Algorithm):
         self.current_cmd_middle = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_quiet = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.current_cmd_target_div = Mutable(torch.tensor(0.0, device=self.device))
-        self.current_refinement_mode = Mutable(torch.tensor(False, dtype=torch.bool, device=self.device))
-        self.current_rescue_strength = Mutable(torch.tensor(1.0, device=self.device))
+        self.current_gate_refine = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_gate_recover = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_intent_eff = Mutable(torch.zeros(6, device=self.device))
 
         # 鍖呰鍣ㄨ嚜宸辩淮鎶ょ殑鏈€浼樿褰?
         self.global_best_fit = Mutable(torch.tensor(torch.inf, device=self.device))
@@ -152,7 +153,7 @@ class RLECWrapper(Algorithm):
             pop_t=current_pop, fit_t=current_fit,
             pop_t_minus_k=self.stage_start_pop, fit_t_minus_k=self.stage_start_fit,
             stagnation=self.stagnation,
-            last_action=self.last_intent,
+            last_action=self.last_intent_eff,
             feedback_stats=torch.stack([
                 self.last_intervene_ratio,
                 self.last_accept_ratio,
@@ -173,9 +174,7 @@ class RLECWrapper(Algorithm):
         intent_tensor = torch.tensor(intent_np, device=self.device, dtype=torch.float32)
         intent_obj = IntentVector.from_tensor(intent_tensor)
 
-        # Safety fallback for weak EA:
-        # when a stage has almost no progress and diversity is near-collapse,
-        # force stronger exploration/rescue budgets.
+        # Continuous gates: do not overwrite actions, only rescale their effects.
         stage_best_start = torch.min(self.stage_start_fit)
         stage_best_now = torch.min(current_fit)
         stage_progress = (stage_best_start - stage_best_now) / (torch.abs(stage_best_start) + 1e-8)
@@ -185,46 +184,48 @@ class RLECWrapper(Algorithm):
         spread_ratio = (median_now - best_now) / (torch.abs(best_now) + 1e-8)
         stag_ratio = torch.mean((self.stagnation >= 10).float())
 
-        # Refinement mode: convergence in a compact basin, reduce interference.
-        is_refinement_mode = bool(
-            (div_ratio.item() < 0.08 and spread_ratio.item() < 0.15 and stag_ratio.item() > 0.3)
-            or (stage_progress.item() < 1e-5 and spread_ratio.item() < 0.08 and div_ratio.item() < 0.12)
+        refine_div = torch.clamp((0.15 - div_ratio) / 0.15, 0.0, 1.0)
+        refine_spread = torch.clamp((0.20 - spread_ratio) / 0.20, 0.0, 1.0)
+        refine_prog = torch.clamp((1e-4 - stage_progress) / 1e-4, 0.0, 1.0)
+        refine_stag = torch.clamp((stag_ratio - 0.2) / 0.6, 0.0, 1.0)
+        g_refine = torch.clamp(
+            0.35 * refine_div
+            + 0.25 * refine_spread
+            + 0.20 * refine_prog
+            + 0.20 * refine_stag,
+            0.0,
+            1.0,
         )
 
-        if is_refinement_mode:
-            intent_obj = IntentVector(
-                e_t=min(intent_obj.e_t, 0.05),
-                x_t=max(intent_obj.x_t, 0.75),
-                d_t=min(intent_obj.d_t, 0.20),
-                b_t=min(intent_obj.b_t, 0.08),
-                r_t=min(intent_obj.r_t, 0.03),
-                p_t=max(intent_obj.p_t, 0.95),
-            )
-            self.current_refinement_mode = torch.tensor(True, dtype=torch.bool, device=self.device)
-            self.current_rescue_strength = torch.tensor(0.30, device=self.device)
-        else:
-            # Weak-EA fallback: no progress + collapse but not a tight-quality basin.
-            if stage_progress.item() < 1e-4 and div_ratio.item() < 0.15 and spread_ratio.item() > 0.20:
-                intent_obj = IntentVector(
-                    e_t=max(intent_obj.e_t, 0.65),
-                    x_t=min(intent_obj.x_t, 0.45),
-                    d_t=max(intent_obj.d_t, 0.60),
-                    b_t=max(intent_obj.b_t, 0.35),
-                    r_t=max(intent_obj.r_t, 0.25),
-                    p_t=max(intent_obj.p_t, 0.80),
-                )
-            self.current_refinement_mode = torch.tensor(False, dtype=torch.bool, device=self.device)
-            self.current_rescue_strength = torch.tensor(1.0, device=self.device)
+        recover_div = torch.clamp((0.18 - div_ratio) / 0.18, 0.0, 1.0)
+        recover_prog = torch.clamp((1e-4 - stage_progress) / 1e-4, 0.0, 1.0)
+        recover_spread = torch.clamp((spread_ratio - 0.20) / 0.40, 0.0, 1.0)
+        g_recover = torch.clamp(
+            0.40 * recover_div
+            + 0.30 * recover_prog
+            + 0.30 * recover_spread,
+            0.0,
+            1.0,
+        ) * (1.0 - g_refine)
 
-        intent_tensor = torch.tensor(
-            [intent_obj.e_t, intent_obj.x_t, intent_obj.d_t, intent_obj.b_t, intent_obj.r_t, intent_obj.p_t],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        cmd = self.interpreter.interpret(intent_obj, current_fit, self.stagnation, self.initial_div.item())
+        e_eff = torch.clamp(intent_tensor[0] * (1.0 - 0.85 * g_refine) + 0.50 * g_recover * (1.0 - intent_tensor[0]), 0.0, 1.0)
+        x_eff = torch.clamp(intent_tensor[1] + 0.25 * g_refine * (1.0 - intent_tensor[1]), 0.0, 1.0)
+        d_eff = torch.clamp(intent_tensor[2] * (1.0 - 0.50 * g_refine) + 0.30 * g_recover * (1.0 - intent_tensor[2]), 0.0, 1.0)
+        b_eff = torch.clamp(intent_tensor[3] * (1.0 - 0.75 * g_refine) + 0.45 * g_recover * (1.0 - intent_tensor[3]), 0.0, 1.0)
+        r_eff = torch.clamp(intent_tensor[4] * (1.0 - 0.90 * g_refine) + 0.35 * g_recover * (1.0 - intent_tensor[4]), 0.0, 1.0)
+        p_eff = torch.clamp(intent_tensor[5] + 0.30 * g_refine * (1.0 - intent_tensor[5]), 0.0, 1.0)
+
+        intent_eff_tensor = torch.stack([e_eff, x_eff, d_eff, b_eff, r_eff, p_eff]).to(self.device)
+        intent_eff_obj = IntentVector.from_tensor(intent_eff_tensor)
+
+        self.current_gate_refine = g_refine.detach()
+        self.current_gate_recover = g_recover.detach()
+
+        cmd = self.interpreter.interpret(intent_eff_obj, current_fit, self.stagnation, self.initial_div.item())
 
         self.last_action_raw = torch.tensor(action_raw, device=self.device)
         self.last_intent = intent_tensor.clone()
+        self.last_intent_eff = intent_eff_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device)
         self.last_value = torch.tensor(value, device=self.device)
 
@@ -237,6 +238,17 @@ class RLECWrapper(Algorithm):
         self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
         self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
         self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
+
+        # Sync any potential interpreter-side normalized clipping back to effective action.
+        intent_eff_tensor = torch.tensor(
+            [
+                intent_eff_obj.e_t, intent_eff_obj.x_t, intent_eff_obj.d_t,
+                intent_eff_obj.b_t, intent_eff_obj.r_t, intent_eff_obj.p_t
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.last_intent_eff = intent_eff_tensor.clone()
 
         # # 5. 銆愮‖鏍告垬鏈姩浣滐細鐮村眬鏁戞彺銆?
         # # 鍦ㄩ樁娈靛垵锛屽琚爣璁颁负 rescue 鐨勭矑瀛愭柦鍔犳棤瑙嗙墿鐞嗚寰嬬殑闅忔満浼犻€侊紒
@@ -284,7 +296,7 @@ class RLECWrapper(Algorithm):
                 stagnation_start=self.stage_start_stagnation,
                 stag_ratio_start=stag_ratio_start.item(),
                 stag_ratio_end=stag_ratio_end.item(),
-                action=self.last_intent,
+                action=self.last_intent_eff,
                 feedbacks=feedbacks
             )
             self.rl_agent.buffer.add(
@@ -312,14 +324,14 @@ class RLECWrapper(Algorithm):
         pop_std = torch.std(curr_pop, dim=0) + 1e-8
         trial_pop = curr_pop.clone()
 
-        intent = IntentVector.from_tensor(self.last_intent)
+        intent = IntentVector.from_tensor(self.last_intent_eff)
         middle_mask = self.current_cmd_middle
         rescue_mask = self.current_cmd_rescue
         quiet_mask = self.current_cmd_quiet
-        refinement_mode = bool(self.current_refinement_mode.item())
+        refine_gate = float(self.current_gate_refine.item())
 
-        # Keep good stagnation particles quiet in refinement mode.
-        if refinement_mode:
+        # Keep good stagnation particles quiet when refinement gate is high.
+        if refine_gate > 0.5:
             middle_mask = middle_mask & (~quiet_mask)
             rescue_mask = rescue_mask & (~quiet_mask)
 
@@ -339,8 +351,11 @@ class RLECWrapper(Algorithm):
         # 3. 鍋滄粸鏁戞彺 (r) - 淇¤禆鍩熷紡鎭㈠
         if rescue_mask.any():
             rescue_scales = self.current_cmd_scales[rescue_mask].unsqueeze(1)
-            trial_pop[rescue_mask] = self.global_best_location + torch.randn_like(
-                trial_pop[rescue_mask]) * pop_std * 2.0 * self.current_rescue_strength * rescue_scales
+            rescue_strength = 1.0 - 0.8 * refine_gate
+            base_pos = curr_pop[rescue_mask]
+            to_best = self.global_best_location - base_pos
+            noise = torch.randn_like(base_pos) * pop_std * 0.5 * rescue_strength * rescue_scales
+            trial_pop[rescue_mask] = base_pos + 0.3 * to_best + noise
 
         trial_pop = clamp(trial_pop, self.lb, self.ub)
 
@@ -358,7 +373,7 @@ class RLECWrapper(Algorithm):
             strict_accept = trial_fit < curr_fit
             margin_fit = curr_fit + torch.abs(curr_fit) * self.current_cmd_alpha_margin + self.current_cmd_beta_margin
             soft_accept = trial_fit < margin_fit
-            if refinement_mode:
+            if refine_gate > 0.65:
                 accept_mask = strict_accept
             else:
                 accept_mask = strict_accept | (rescue_mask & soft_accept)

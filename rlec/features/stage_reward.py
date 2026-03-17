@@ -46,11 +46,11 @@ class StageRewardCalculator:
         # mild action regularization: avoid extreme exploration-exploitation imbalance.
         action = torch.clamp(action, 0.0, 1.0)
         e_t, x_t, _, b_t, _, _ = action.tolist()
-        r_balance = -0.1 * abs(e_t - x_t)
+        r_balance = -0.02 * abs(e_t - x_t)
         r_budget_safety = -0.05 * max(0.0, b_t - 0.8)
         # Encourage "settling down" when stage already reaches a compact basin.
         compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
-        r_late_settle = (-0.4 * e_t - 0.3 * b_t) if compact_basin else 0.0
+        r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
 
         r_ctrl = r_efficiency + r_rescue + r_elite_stab + r_div_overshoot + r_stag + r_balance + r_budget_safety + r_late_settle
 

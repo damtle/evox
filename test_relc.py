@@ -68,8 +68,8 @@ def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int
         history.append(best_val)
 
         # 记录当前活跃的 Intent 向量 (仅当启用了 RL)
-        if enable_rl and hasattr(algorithm, 'last_intent'):
-            intent_history.append(algorithm.last_intent.detach().cpu().numpy())
+        if enable_rl and hasattr(algorithm, 'last_intent_eff'):
+            intent_history.append(algorithm.last_intent_eff.detach().cpu().numpy())
 
     return best_val, history, np.array(intent_history), algo_name
 
