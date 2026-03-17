@@ -25,7 +25,7 @@ def run_experiment(func_id: int, dim: int, enable_rl: bool, max_generations: int
 
     algorithm = make_rlec_code(
         pop_size=100, lb=lb, ub=ub, device=device,
-        stage_length=20, update_stages=5, enable_rl=enable_rl
+        stage_length=10, update_stages=2, enable_rl=enable_rl
     )
 
     algo_name = algorithm.base.__class__.__name__ if enable_rl else algorithm.__class__.__name__

@@ -12,7 +12,7 @@ def create_rlec_structure(base_path="rlec"):
         "algorithms": ["__init__.py", "rlec_wrapper.py", "code_rlec.py"],
         "control": ["__init__.py", "intent_vector.py", "interpreter.py"],
         "features": ["__init__.py", "macro_state.py", "stage_reward.py"],
-        "rl": ["__init__.py", "ppo_lstm.py", "networks.py", "rollout_buffer.py"],
+        "rl": ["__init__.py", "ppo.py", "networks.py", "rollout_buffer.py"],
         "utils": ["__init__.py", "population_metrics.py"]
     }
 

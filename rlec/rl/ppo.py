@@ -7,8 +7,8 @@ from .rollout_buffer import RolloutBuffer
 
 class PPO:
     def __init__(self, state_dim: int, action_dim: int, device: torch.device,
-                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.2,
-                 entropy_coef=0.01, k_epochs=4):
+                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.15,
+                 entropy_coef=0.002, k_epochs=2):
         self.device = device
         self.gamma = gamma
         self.clip_ratio = clip_ratio
@@ -31,14 +31,20 @@ class PPO:
 
             dist = self.actor(state)
             value = self.critic(state)
-            action = dist.mean if deterministic else dist.sample()
-            log_prob = dist.log_prob(action).sum(dim=-1)
+            action_delta = dist.mean if deterministic else dist.sample()
+            log_prob = dist.log_prob(action_delta).sum(dim=-1)
 
-            raw_action = torch.clamp(action, -4.0, 4.0)
-            intent_action = torch.sigmoid(raw_action)
+            # 动作平滑与安全先验 (Safe Prior)
+            # a_safe: [e=0.3, x=0.5, d=0.5, b=0.2, r=0.1, p=0.8] 提供稳健初始形态
+            a_safe = torch.tensor([0.3, 0.5, 0.5, 0.2, 0.1, 0.8], device=self.device)
+            epsilon = 0.2  # 最大允许网络偏离安全值的范围
+
+            # 使用 tanh 把网络输出压到 [-1, 1]，然后映射到微调区间
+            delta_scaled = torch.tanh(action_delta) * epsilon
+            intent_action = torch.clamp(a_safe + delta_scaled, 0.0, 1.0)
 
         return (
-            action.squeeze(0).cpu().numpy(),
+            action_delta.squeeze(0).cpu().numpy(),
             intent_action.squeeze(0).cpu().numpy(),
             log_prob.squeeze(0).item(),
             value.squeeze(0).item()
