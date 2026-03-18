@@ -2,85 +2,76 @@ import torch
 
 from rlec.control.intent_vector import IntentVector
 from rlec.control.interpreter import ControlInterpreter
-from rlec.control.niche_manager import NicheManager
+from rlec.control.subpopulation_manager import SubpopulationManager
 from rlec.features.macro_state import MacroStateBuilder
 from rlec.features.stage_reward import StageRewardCalculator
 
 
-def _make_manager() -> NicheManager:
-    return NicheManager(
-        pop_size=8,
+def _make_manager() -> SubpopulationManager:
+    return SubpopulationManager(
+        pop_size=20,
         dim=2,
         device=torch.device("cpu"),
-        complete_patience=2,
-        max_anchor_niches=2,
-        merge_dist=0.5,
-        merge_fit_eps=0.2,
+        exploit_ratio=0.20,
+        bridge_ratio=0.30,
+        explore_ratio=0.50,
+        migration_period=4,
     )
 
 
-def test_completion_patience_requires_consecutive_stages():
+def test_subpop_init_ratio_and_unique_membership():
     mgr = _make_manager()
+    mgr.init_subpops()
 
-    pop = torch.tensor(
-        [
-            [0.00, 0.00],
-            [0.01, 0.00],
-            [0.00, 0.01],
-            [1.00, 1.00],
-            [1.01, 1.00],
-            [1.00, 1.01],
-            [2.00, 2.00],
-            [2.01, 2.00],
-        ],
-        dtype=torch.float32,
+    ids = mgr.subpop_ids
+    assert ids.shape[0] == 20
+    assert bool(((ids >= 0) & (ids <= 2)).all().item())
+
+    n_exploit = int((ids == SubpopulationManager.EXPLOIT).sum().item())
+    n_bridge = int((ids == SubpopulationManager.BRIDGE).sum().item())
+    n_explore = int((ids == SubpopulationManager.EXPLORE).sum().item())
+    assert n_exploit + n_bridge + n_explore == 20
+    assert n_exploit >= 1 and n_bridge >= 1 and n_explore >= 1
+
+
+def test_migration_and_apply_updates_ids_and_age():
+    mgr = _make_manager()
+    mgr.init_subpops()
+
+    pop = torch.rand((20, 2))
+    fit = torch.linspace(0.0, 1.0, 20)
+    prev_fit = fit + 0.1
+    stagnation = torch.zeros(20)
+
+    # Force exploit stagnation to enable x2e.
+    exploit_idx = torch.where(mgr.subpop_ids == SubpopulationManager.EXPLOIT)[0]
+    if exploit_idx.numel() > 0:
+        stagnation[exploit_idx[:1]] = 15.0
+
+    intent = torch.tensor([0.7, 0.3, 0.6, 0.8, 0.7, 0.5])
+    plan = mgr.plan_stage(pop, fit, prev_fit, stagnation, stage_id=4, intent_eff=intent)
+
+    moved_before = int(
+        plan.migrate_to_exploit.sum().item()
+        + plan.migrate_to_bridge.sum().item()
+        + plan.migrate_to_explore.sum().item()
     )
-    fit = torch.tensor([0.1, 0.12, 0.11, 0.2, 0.21, 0.19, 0.4, 0.41], dtype=torch.float32)
+    mgr.apply_migration(plan, stage_id=4)
 
-    stage_start_pop = pop * 1.5
-    stage_start_fit = fit + 1e-4
-    stage_start_stag = torch.zeros(pop.shape[0])
-    stag = torch.zeros(pop.shape[0])
-    intent_eff = torch.tensor([0.4, 0.5, 0.2, 0.3, 0.2, 0.5], dtype=torch.float32)
-
-    plan1 = mgr.plan(pop, fit, stage_start_pop, stage_start_fit, stage_start_stag, stag, intent_eff, initial_div=1.0)
-    assert not bool(plan1.completed_mask.any().item())
-
-    plan2 = mgr.plan(pop, fit, stage_start_pop, stage_start_fit, stage_start_stag, stag, intent_eff, initial_div=1.0)
-    assert bool(plan2.completed_mask.any().item())
+    assert mgr.subpop_ids.shape[0] == 20
+    if moved_before > 0:
+        assert mgr.last_migration_stage == 4
 
 
-def test_overlap_group_uses_distance_and_fitness_conditions():
-    mgr = _make_manager()
-    centers = torch.tensor([[0.0, 0.0], [0.1, 0.1], [3.0, 3.0]], dtype=torch.float32)
-    best_fit = torch.tensor([1.0, 1.05, 1.01], dtype=torch.float32)
-
-    gids = mgr._detect_overlap_groups(centers, best_fit, merge_dist=0.5, merge_fit_eps=0.1)
-
-    assert int(gids[0].item()) == int(gids[1].item())
-    assert int(gids[0].item()) != int(gids[2].item())
-
-
-def test_anchor_selection_respects_max_count():
-    mgr = _make_manager()
-    rows = [
-        {"status": "refining", "is_overlap_redundant": False, "best_fit": 1.0, "niche_age": 3, "radius_rel": 0.02, "best_improve_rel": 0.001},
-        {"status": "completed", "is_overlap_redundant": False, "best_fit": 0.9, "niche_age": 2, "radius_rel": 0.01, "best_improve_rel": 0.0002},
-        {"status": "refining", "is_overlap_redundant": False, "best_fit": 0.95, "niche_age": 1, "radius_rel": 0.03, "best_improve_rel": 0.002},
-    ]
-    selected = mgr._select_anchor_niches(rows, max_anchor_niches=2)
-    assert len(selected) == 2
-
-
-def test_interpreter_anchor_blocks_rescue_and_scales_down():
+def test_interpreter_subpop_role_behavior():
     interp = ControlInterpreter(pop_size=6)
-    intent = IntentVector(e_t=0.6, x_t=0.4, d_t=0.5, b_t=0.6, r_t=0.6, p_t=0.2)
+    intent = IntentVector(e_t=0.7, x_t=0.4, d_t=0.5, b_t=0.6, r_t=0.6, p_t=0.4)
     fit = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=torch.float32)
-    stag = torch.tensor([0.0, 12.0, 10.0, 5.0, 8.0, 7.0], dtype=torch.float32)
+    stag = torch.tensor([12.0, 10.0, 8.0, 6.0, 5.0, 3.0], dtype=torch.float32)
 
-    anchor = torch.tensor([True, True, False, False, False, False])
-    scout = torch.tensor([False, False, True, True, False, False])
-    completed = torch.tensor([False, False, False, False, True, False])
+    exploit = torch.tensor([True, True, False, False, False, False])
+    bridge = torch.tensor([False, False, True, True, False, False])
+    explore = torch.tensor([False, False, False, False, True, True])
     guardian = torch.tensor([True, False, False, False, False, False])
 
     cmd = interp.interpret(
@@ -88,19 +79,19 @@ def test_interpreter_anchor_blocks_rescue_and_scales_down():
         fit,
         stag,
         initial_div=1.0,
-        niche_roles={
-            "anchor_mask": anchor,
-            "scout_mask": scout,
-            "completed_mask": completed,
-            "guardian_mask": guardian,
+        subpop_roles={
+            "exploit_mask": exploit,
+            "bridge_mask": bridge,
+            "explore_mask": explore,
+            "exploit_guardian_mask": guardian,
         },
     )
 
-    assert not bool(cmd.rescue_mask[anchor].any().item())
-    assert bool((cmd.step_scales[anchor] <= 0.5).all().item())
+    assert not bool(cmd.rescue_mask[exploit].any().item())
+    assert bool((cmd.step_scales[explore] >= cmd.step_scales[bridge]).all().item())
 
 
-def test_macro_state_and_reward_dimensions():
+def test_macro_state_and_reward_interfaces():
     builder = MacroStateBuilder(dim=2, pop_size=8)
     assert builder.state_dim == 30
 
@@ -123,6 +114,6 @@ def test_macro_state_and_reward_dimensions():
         stag_ratio_end=0.1,
         action=torch.tensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5]),
         feedbacks=torch.tensor([0.2, 0.3, 0.1, 0.0]),
-        niche_stats=torch.tensor([0.1, 0.1, 0.1, 0.9, 0.5, 0.8, 0.3, 0.2]),
+        subpop_stats=torch.tensor([0.8, 0.6, 0.5, 0.7, 0.2]),
     )
     assert isinstance(reward, float)

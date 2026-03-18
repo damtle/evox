@@ -4,12 +4,14 @@ from torch.distributions import Normal
 
 
 class ActorMLP(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 32):  # 降至 32
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim)  # 去掉第二层隐藏层，加速拟合
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim),
         )
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))
 
@@ -19,10 +21,12 @@ class ActorMLP(nn.Module):
         return Normal(mean, std)
 
 class CriticMLP(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 32):
+    def __init__(self, state_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )

@@ -18,7 +18,7 @@ class StageRewardCalculator:
         stag_ratio_end: float,
         action: torch.Tensor,
         feedbacks: torch.Tensor,
-        niche_stats: torch.Tensor,
+        subpop_stats: torch.Tensor,
     ) -> float:
         intervene_ratio, accept_ratio, rescue_success, elite_damage = feedbacks
 
@@ -50,42 +50,27 @@ class StageRewardCalculator:
         compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
         r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
 
-        # niche_stats = [
-        #   new_niche_norm, archive_unique_norm, repeat_ratio,
-        #   guardian_stability, release_efficiency,
-        #   anchor_stability, scout_birth_efficiency, overlap_penalty
+        # subpop_stats = [
+        #   exploit_stability,
+        #   explore_birth_efficiency,
+        #   bridge_transfer_efficiency,
+        #   migration_efficiency,
+        #   subpop_balance_penalty,
         # ]
         (
-            new_niche_norm,
-            archive_unique_norm,
-            repeat_ratio,
-            guardian_stability,
-            release_efficiency,
-            anchor_stability,
-            scout_birth_efficiency,
-            overlap_penalty,
-        ) = niche_stats.tolist()
+            exploit_stability,
+            explore_birth_efficiency,
+            bridge_transfer_efficiency,
+            migration_efficiency,
+            subpop_balance_penalty,
+        ) = subpop_stats.tolist()
 
-        r_new_niche = 0.20 * new_niche_norm
-        r_archive_unique = 0.20 * archive_unique_norm
-        r_repeat_penalty = -0.25 * repeat_ratio
-        r_guardian_stability = 0.20 * guardian_stability
-        r_release_eff = 0.20 * release_efficiency
-
-        # Incremental new terms with small weights.
-        r_anchor_stability = 0.12 * anchor_stability
-        r_scout_birth = 0.12 * scout_birth_efficiency
-        r_overlap_penalty = -0.10 * overlap_penalty
-
-        r_niche = (
-            r_new_niche
-            + r_archive_unique
-            + r_repeat_penalty
-            + r_guardian_stability
-            + r_release_eff
-            + r_anchor_stability
-            + r_scout_birth
-            + r_overlap_penalty
+        r_subpop = (
+            0.25 * exploit_stability
+            + 0.20 * explore_birth_efficiency
+            + 0.15 * bridge_transfer_efficiency
+            + 0.15 * migration_efficiency
+            - 0.20 * subpop_balance_penalty
         )
 
         r_ctrl = (
@@ -99,5 +84,5 @@ class StageRewardCalculator:
             + r_late_settle
         )
 
-        total_reward = r_perf + r_ctrl + r_precision + r_niche
+        total_reward = r_perf + r_ctrl + r_precision + r_subpop
         return total_reward

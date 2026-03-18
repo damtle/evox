@@ -6,24 +6,30 @@ from typing import Dict, List
 
 
 class NicheLogger:
+    """Compatibility logger; now stores stage + subpopulation rows."""
+
     def __init__(self, output_dir: str | None):
         self.output_dir = output_dir
         self.stage_rows: List[Dict] = []
-        self.niche_rows: List[Dict] = []
+        self.subpop_rows: List[Dict] = []
 
     def log_stage(self, row: dict) -> None:
         self.stage_rows.append(row)
 
-    def log_niches(self, rows: list[dict]) -> None:
+    def log_subpops(self, rows: list[dict]) -> None:
         if rows:
-            self.niche_rows.extend(rows)
+            self.subpop_rows.extend(rows)
 
-    def flush(self, stage_csv_path: str, niche_csv_path: str) -> None:
+    # Backward-compatible alias
+    def log_niches(self, rows: list[dict]) -> None:
+        self.log_subpops(rows)
+
+    def flush(self, stage_csv_path: str, subpop_csv_path: str) -> None:
         if self.output_dir is None:
             return
         os.makedirs(self.output_dir, exist_ok=True)
         self._write_csv(stage_csv_path, self.stage_rows)
-        self._write_csv(niche_csv_path, self.niche_rows)
+        self._write_csv(subpop_csv_path, self.subpop_rows)
 
     @staticmethod
     def _write_csv(path: str, rows: List[Dict]) -> None:
@@ -36,4 +42,3 @@ class NicheLogger:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
-

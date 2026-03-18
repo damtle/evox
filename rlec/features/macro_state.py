@@ -12,7 +12,7 @@ class MacroStateBuilder:
     def __init__(self, dim: int, pop_size: int):
         self.dim = dim
         self.pop_size = pop_size
-        self.state_dim = 30  # 8 base + 6 action + 4 feedback + 12 niche summary
+        self.state_dim = 30  # 8 base + 6 action + 4 feedback + 12 subpopulation summary
 
     def build(
         self,
@@ -23,7 +23,7 @@ class MacroStateBuilder:
         stagnation: torch.Tensor,
         last_action: torch.Tensor,
         feedback_stats: torch.Tensor,
-        niche_summary: torch.Tensor,
+        subpop_summary: torch.Tensor,
     ) -> torch.Tensor:
         best_t, best_t_k = torch.min(fit_t), torch.min(fit_t_minus_k)
         median_t, median_t_k = torch.median(fit_t), torch.median(fit_t_minus_k)
@@ -50,7 +50,7 @@ class MacroStateBuilder:
                 torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),
                 torch.clamp(last_action.flatten(), 0.0, 1.0),
                 feedback_stats,
-                niche_summary,
+                subpop_summary,
             ],
             dim=0,
         )
