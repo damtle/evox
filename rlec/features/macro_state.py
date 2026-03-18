@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 from rlec.utils.population_metrics import (
     compute_diversity,
     compute_fitness_skewness,
@@ -12,7 +12,7 @@ class MacroStateBuilder:
     def __init__(self, dim: int, pop_size: int):
         self.dim = dim
         self.pop_size = pop_size
-        self.state_dim = 26  # 8 base + 6 action + 4 feedback + 8 niche summary
+        self.state_dim = 30  # 8 base + 6 action + 4 feedback + 12 niche summary
 
     def build(
         self,

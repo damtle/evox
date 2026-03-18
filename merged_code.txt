@@ -254,966 +254,19 @@ if __name__ == "__main__":
 
 ==================================================
 
-// [MODULE] File: rlec/__init__.py
+// [MODULE] File: rlec\__init__.py
 ----------------------------------------
 
 
 ==================================================
 
-// [MODULE] File: rlec/features/__init__.py
+// [MODULE] File: rlec\algorithms\__init__.py
 ----------------------------------------
 
 
 ==================================================
 
-// [MODULE] File: rlec/features/macro_state.py
-----------------------------------------
-﻿import torch
-from rlec.utils.population_metrics import (
-    compute_diversity,
-    compute_fitness_skewness,
-    compute_rank_entropy,
-    compute_stagnation_ratio,
-    compute_elite_separation,
-)
-
-
-class MacroStateBuilder:
-    def __init__(self, dim: int, pop_size: int):
-        self.dim = dim
-        self.pop_size = pop_size
-        self.state_dim = 26  # 8 base + 6 action + 4 feedback + 8 niche summary
-
-    def build(
-        self,
-        pop_t: torch.Tensor,
-        fit_t: torch.Tensor,
-        pop_t_minus_k: torch.Tensor,
-        fit_t_minus_k: torch.Tensor,
-        stagnation: torch.Tensor,
-        last_action: torch.Tensor,
-        feedback_stats: torch.Tensor,
-        niche_summary: torch.Tensor,
-    ) -> torch.Tensor:
-        best_t, best_t_k = torch.min(fit_t), torch.min(fit_t_minus_k)
-        median_t, median_t_k = torch.median(fit_t), torch.median(fit_t_minus_k)
-        prog_best = (best_t_k - best_t) / (torch.abs(best_t_k) + 1e-8)
-        prog_median = (median_t_k - median_t) / (torch.abs(median_t_k) + 1e-8)
-
-        div_t = compute_diversity(pop_t)
-        div_t_k = compute_diversity(pop_t_minus_k)
-        div_change = (div_t - div_t_k) / (div_t_k + 1e-8)
-        stag_ratio = compute_stagnation_ratio(stagnation, threshold=10)
-        separation = compute_elite_separation(pop_t, fit_t)
-        skewness = compute_fitness_skewness(fit_t)
-        entropy = compute_rank_entropy(fit_t)
-
-        state = torch.cat(
-            [
-                torch.clamp(prog_best.unsqueeze(0), -5.0, 5.0),
-                torch.clamp(prog_median.unsqueeze(0), -5.0, 5.0),
-                torch.clamp(div_t.unsqueeze(0) / 100.0, 0.0, 5.0),
-                torch.clamp(div_change.unsqueeze(0), -1.0, 1.0),
-                stag_ratio.unsqueeze(0),
-                skewness.unsqueeze(0) / 5.0,
-                entropy.unsqueeze(0),
-                torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),
-                torch.clamp(last_action.flatten(), 0.0, 1.0),
-                feedback_stats,
-                niche_summary,
-            ],
-            dim=0,
-        )
-        return state.unsqueeze(0)
-
-
-==================================================
-
-// [MODULE] File: rlec/features/stage_reward.py
-----------------------------------------
-﻿import torch
-
-
-class StageRewardCalculator:
-    def __init__(self):
-        pass
-
-    def calculate(
-        self,
-        fit_start: torch.Tensor,
-        fit_end: torch.Tensor,
-        div_start: float,
-        div_end: float,
-        target_div: float,
-        initial_div: float,
-        stagnation_start: torch.Tensor,
-        stag_ratio_start: float,
-        stag_ratio_end: float,
-        action: torch.Tensor,
-        feedbacks: torch.Tensor,
-        niche_stats: torch.Tensor,
-    ) -> float:
-        intervene_ratio, accept_ratio, rescue_success, elite_damage = feedbacks
-
-        best_start, best_end = torch.min(fit_start), torch.min(fit_end)
-        median_start, median_end = torch.median(fit_start), torch.median(fit_end)
-        q20_start = torch.quantile(fit_start, 0.2)
-        q20_end = torch.quantile(fit_end, 0.2)
-
-        r_best = torch.log1p(torch.relu(best_start - best_end)) / (torch.log1p(torch.abs(best_start)) + 1e-8)
-        r_median = torch.log1p(torch.relu(median_start - median_end)) / (torch.log1p(torch.abs(median_start)) + 1e-8)
-        r_q20 = torch.log1p(torch.relu(q20_start - q20_end)) / (torch.log1p(torch.abs(q20_start)) + 1e-8)
-        r_perf = 2.0 * r_best.item() + 0.5 * r_median.item() + 1.0 * r_q20.item()
-
-        best_end_safe = torch.clamp(best_end, min=0.0)
-        r_precision = 0.02 * (-torch.log(best_end_safe + 1e-12)).item()
-        r_precision = min(r_precision, 0.8)
-
-        r_efficiency = accept_ratio.item() - 0.5 * intervene_ratio.item()
-        r_rescue = rescue_success.item()
-        r_elite_stab = -1.0 * elite_damage.item()
-        div_error = abs(div_end - target_div) / (initial_div + 1e-8)
-        r_div_overshoot = -0.5 * div_error
-        r_stag = stag_ratio_start - stag_ratio_end
-
-        action = torch.clamp(action, 0.0, 1.0)
-        e_t, x_t, _, b_t, _, _ = action.tolist()
-        r_balance = -0.02 * abs(e_t - x_t)
-        r_budget_safety = -0.05 * max(0.0, b_t - 0.8)
-        compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
-        r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
-
-        # Niche-aware credit terms.
-        # niche_stats = [new_niche_norm, archive_unique_norm, repeat_ratio, guardian_stability, release_efficiency]
-        new_niche_norm, archive_unique_norm, repeat_ratio, guardian_stability, release_efficiency = niche_stats.tolist()
-        r_new_niche = 0.20 * new_niche_norm
-        r_archive_unique = 0.20 * archive_unique_norm
-        r_repeat_penalty = -0.25 * repeat_ratio
-        r_guardian_stability = 0.20 * guardian_stability
-        r_release_eff = 0.20 * release_efficiency
-        r_niche = r_new_niche + r_archive_unique + r_repeat_penalty + r_guardian_stability + r_release_eff
-
-        r_ctrl = (
-            r_efficiency
-            + r_rescue
-            + r_elite_stab
-            + r_div_overshoot
-            + r_stag
-            + r_balance
-            + r_budget_safety
-            + r_late_settle
-        )
-
-        total_reward = r_perf + r_ctrl + r_precision + r_niche
-        return total_reward
-
-
-==================================================
-
-// [MODULE] File: rlec/control/__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec/control/intent_vector.py
-----------------------------------------
-import torch
-from dataclasses import dataclass
-
-
-@dataclass
-class IntentVector:
-    """
-    RLEC 战略意图向量 (6D)
-    所有值均被规范化到 [0, 1] 范围内
-    """
-    e_t: float  # Exploration pressure (探索压力): 鼓励大跨度搜索，容忍变差
-    x_t: float  # Exploitation pressure (开发压力): 鼓励局部微调，严格要求提升
-    d_t: float  # Diversity target (多样性目标): 0.0 代表允许坍缩，1.0 代表极度分散
-    b_t: float  # Intervention budget (干预预算): 本阶段允许干预的最大个体比例
-    r_t: float  # Rescue budget (脱困预算): 给停滞个体分配的重构资源比例
-    p_t: float  # Elite protection (精英保护): 精英个体免受随机扰动的保护强度
-
-    @classmethod
-    def from_tensor(cls, action_tensor: torch.Tensor) -> 'IntentVector':
-        """
-        将 PPO 网络的输出（通常在 [-1, 1] 之间）映射到 [0, 1] 的物理意图区间
-        """
-        a = torch.clamp(action_tensor.squeeze(), 0.0, 1.0).tolist()
-
-        return cls(
-            e_t=a[0], x_t=a[1], d_t=a[2],
-            b_t=a[3], r_t=a[4], p_t=a[5]
-        )
-
-    def __repr__(self):
-        return (f"Intent[Explor:{self.e_t:.2f}, Exploit:{self.x_t:.2f}, Div:{self.d_t:.2f}, "
-                f"Budget:{self.b_t:.2f}, Rescue:{self.r_t:.2f}, Elite:{self.p_t:.2f}]")
-
-==================================================
-
-// [MODULE] File: rlec/control/interpreter.py
-----------------------------------------
-﻿import torch
-from dataclasses import dataclass
-from .intent_vector import IntentVector
-
-
-@dataclass
-class EACommand:
-    protected_mask: torch.Tensor
-    rescue_mask: torch.Tensor
-    middle_mask: torch.Tensor
-    quiet_mask: torch.Tensor
-    step_scales: torch.Tensor
-    alpha_margin: float
-    beta_margin: float
-    target_diversity: float
-
-
-class ControlInterpreter:
-    def __init__(self, pop_size: int, max_stagnation: int = 10):
-        self.pop_size = pop_size
-        self.max_stag = max_stagnation
-
-    def interpret(self, intent: IntentVector, fit: torch.Tensor,
-                  stagnation: torch.Tensor, initial_div: float) -> EACommand:
-        device = fit.device
-        n = self.pop_size
-
-        # Lower fit is better. rank_percentile: 0 -> best, 1 -> worst
-        _, rank_idx = torch.sort(fit, descending=True)
-        rank_percentile = torch.empty(n, device=device)
-        rank_percentile[rank_idx] = torch.arange(n, dtype=torch.float32, device=device) / (n - 1)
-
-        # Separate good stagnation (near-best fine-tuning) from bad stagnation.
-        fit_std = torch.std(fit) + 1e-8
-        best_fit = torch.min(fit)
-        norm_gap_to_best = (fit - best_fit) / fit_std
-        near_best_mask = norm_gap_to_best < 0.5
-        good_stagnation_mask = (stagnation >= self.max_stag) & (rank_percentile < 0.3) & near_best_mask
-
-        # Intervention priority should favor bad stagnation in mid/worse ranks.
-        mid_pref = 1.0 - torch.abs(rank_percentile - 0.5) * 2.0
-        bad_stagnation = (stagnation / self.max_stag) * rank_percentile
-        score = 0.55 * bad_stagnation + 0.30 * mid_pref + 0.15 * rank_percentile
-
-        n_intervene = int(n * intent.b_t)
-        intervene_mask = torch.zeros(n, dtype=torch.bool, device=device)
-        if n_intervene > 0:
-            _, intervene_idx = torch.topk(score, n_intervene)
-            intervene_mask[intervene_idx] = True
-
-        # Do not disturb good stagnation particles.
-        intervene_mask = intervene_mask & (~good_stagnation_mask)
-
-        # Elite protection
-        k_elite = max(1, int(n * 0.10 * intent.p_t))
-        _, sorted_indices = torch.sort(fit)
-        protected_mask = torch.zeros(n, dtype=torch.bool, device=device)
-        if intent.p_t > 0.05:
-            protected_mask[sorted_indices[:k_elite]] = True
-
-        intervene_mask = intervene_mask & (~protected_mask)
-
-        # Rescue focuses on truly bad stagnation; skip elite/near-best region.
-        num_rescue = int(n_intervene * intent.r_t)
-        rescue_mask = torch.zeros(n, dtype=torch.bool, device=device)
-        if num_rescue > 0:
-            rescue_priority = stagnation.clone()
-            rescue_priority[~intervene_mask] = -1.0
-            rescue_priority[good_stagnation_mask] = -1.0
-            rescue_priority[rank_percentile < 0.3] = -1.0
-            _, rescue_idx = torch.topk(rescue_priority, num_rescue)
-            rescue_mask[rescue_idx] = True
-
-        rescue_mask = rescue_mask & (~protected_mask)
-        middle_mask = intervene_mask & (~rescue_mask) & (~protected_mask)
-
-        # Step scaling for execution layer.
-        global_scale = 1.0 + 2.0 * intent.e_t
-        step_scales = torch.ones(n, device=device)
-        step_scales[middle_mask] = 1.0 + intent.e_t - 0.5 * intent.x_t
-        step_scales[rescue_mask] = global_scale
-
-        alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
-        beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
-
-        # Allow true convergence to near-zero diversity in refinement stage.
-        target_diversity = initial_div * intent.d_t
-
-        return EACommand(
-            protected_mask=protected_mask,
-            rescue_mask=rescue_mask,
-            middle_mask=middle_mask,
-            quiet_mask=good_stagnation_mask,
-            step_scales=step_scales,
-            alpha_margin=alpha_margin,
-            beta_margin=beta_margin,
-            target_diversity=target_diversity,
-        )
-
-
-==================================================
-
-// [MODULE] File: rlec/control/niche_manager.py
-----------------------------------------
-﻿from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List
-
-import torch
-
-
-@dataclass
-class NichePlan:
-    exploring_mask: torch.Tensor
-    refining_mask: torch.Tensor
-    converged_mask: torch.Tensor
-    guardian_mask: torch.Tensor
-    release_mask: torch.Tensor
-    rescue_mask: torch.Tensor
-    cluster_ids: torch.Tensor
-    active_centers: torch.Tensor
-    niche_rows: List[Dict]
-    n_new_niches: int
-    archive_added: int
-
-
-class NicheManager:
-    """Niche-level lifecycle planner with stable niche IDs and archive."""
-
-    def __init__(self, pop_size: int, dim: int, device: torch.device):
-        self.pop_size = pop_size
-        self.dim = dim
-        self.device = device
-        self.archive_centers = torch.empty((0, dim), device=device)
-
-        self.prev_centers = torch.empty((0, dim), device=device)
-        self.prev_ids: List[int] = []
-        self.prev_ages: List[int] = []
-        self.next_niche_id = 0
-
-    def _cluster(self, pop: torch.Tensor, fit: torch.Tensor, eps: float) -> tuple[torch.Tensor, List[torch.Tensor]]:
-        n = pop.shape[0]
-        cluster_ids = torch.full((n,), -1, dtype=torch.long, device=pop.device)
-        order = torch.argsort(fit)  # best-first
-        cid = 0
-        for idx in order:
-            i = int(idx.item())
-            if cluster_ids[i] != -1:
-                continue
-            d = torch.norm(pop - pop[i], dim=1)
-            members = (d <= eps) & (cluster_ids == -1)
-            cluster_ids[members] = cid
-            cid += 1
-
-        clusters: List[torch.Tensor] = []
-        for k in range(cid):
-            clusters.append(torch.where(cluster_ids == k)[0])
-        return cluster_ids, clusters
-
-    def _update_archive(self, centers: List[torch.Tensor], min_dist: float) -> int:
-        added = 0
-        for c in centers:
-            if self.archive_centers.numel() == 0:
-                self.archive_centers = c.unsqueeze(0)
-                added += 1
-                continue
-            d = torch.norm(self.archive_centers - c.unsqueeze(0), dim=1)
-            if torch.min(d).item() > min_dist:
-                self.archive_centers = torch.cat([self.archive_centers, c.unsqueeze(0)], dim=0)
-                added += 1
-        return added
-
-    def _assign_stable_ids(self, centers: List[torch.Tensor], eps: float) -> tuple[List[int], List[int], int]:
-        if len(centers) == 0:
-            self.prev_centers = torch.empty((0, self.dim), device=self.device)
-            self.prev_ids = []
-            self.prev_ages = []
-            return [], [], 0
-
-        if self.prev_centers.numel() == 0:
-            ids = []
-            ages = []
-            for _ in centers:
-                ids.append(self.next_niche_id)
-                ages.append(1)
-                self.next_niche_id += 1
-            self.prev_centers = torch.stack(centers, dim=0)
-            self.prev_ids = ids
-            self.prev_ages = ages
-            return ids, ages, len(ids)
-
-        curr = torch.stack(centers, dim=0)
-        d = torch.cdist(curr, self.prev_centers)
-        match_dist = max(1e-6, 1.5 * eps)
-
-        ids = [-1] * len(centers)
-        ages = [1] * len(centers)
-        used_prev = set()
-
-        # Greedy nearest matching under threshold.
-        flat = []
-        for i in range(d.shape[0]):
-            for j in range(d.shape[1]):
-                flat.append((float(d[i, j].item()), i, j))
-        flat.sort(key=lambda x: x[0])
-        for dist_ij, i, j in flat:
-            if dist_ij > match_dist:
-                break
-            if ids[i] != -1 or j in used_prev:
-                continue
-            ids[i] = self.prev_ids[j]
-            ages[i] = self.prev_ages[j] + 1
-            used_prev.add(j)
-
-        new_count = 0
-        for i in range(len(ids)):
-            if ids[i] == -1:
-                ids[i] = self.next_niche_id
-                ages[i] = 1
-                self.next_niche_id += 1
-                new_count += 1
-
-        self.prev_centers = curr
-        self.prev_ids = ids
-        self.prev_ages = ages
-        return ids, ages, new_count
-
-    def plan(
-        self,
-        pop: torch.Tensor,
-        fit: torch.Tensor,
-        stage_start_pop: torch.Tensor,
-        stage_start_fit: torch.Tensor,
-        stage_start_stagnation: torch.Tensor,
-        stagnation: torch.Tensor,
-        intent_eff: torch.Tensor,
-        initial_div: float,
-    ) -> NichePlan:
-        n = pop.shape[0]
-        device = pop.device
-        current_div = torch.std(pop, dim=0).mean().item()
-        eps = max(1e-6, 0.5 * current_div + 0.5 * float(initial_div) * (0.08 + 0.20 * float(intent_eff[2].item())))
-
-        cluster_ids_local, clusters = self._cluster(pop, fit, eps=eps)
-
-        exploring = torch.zeros(n, dtype=torch.bool, device=device)
-        refining = torch.zeros(n, dtype=torch.bool, device=device)
-        converged = torch.zeros(n, dtype=torch.bool, device=device)
-        guardian = torch.zeros(n, dtype=torch.bool, device=device)
-        release = torch.zeros(n, dtype=torch.bool, device=device)
-        rescue = torch.zeros(n, dtype=torch.bool, device=device)
-
-        centers: List[torch.Tensor] = []
-        converged_centers: List[torch.Tensor] = []
-        active_centers: List[torch.Tensor] = []
-        release_pool: List[int] = []
-        rescue_pool: List[int] = []
-
-        # Per-niche temporary metrics for logging.
-        niche_tmp: List[Dict] = []
-
-        guard_ratio = 0.05 + 0.20 * float(intent_eff[5].item())
-        for local_cid, members in enumerate(clusters):
-            m = members
-            c_pop = pop[m]
-            c_fit = fit[m]
-            c_pop_start = stage_start_pop[m]
-            c_fit_start = stage_start_fit[m]
-            c_stag = stagnation[m]
-            c_stag_start = stage_start_stagnation[m]
-
-            center = torch.mean(c_pop, dim=0)
-            centers.append(center)
-
-            center_start = torch.mean(c_pop_start, dim=0)
-            radius = torch.norm(c_pop - center.unsqueeze(0), dim=1).mean()
-            radius_start = torch.norm(c_pop_start - center_start.unsqueeze(0), dim=1).mean()
-            radius_rel = (radius / (initial_div + 1e-8)).item()
-            radius_shrink = ((radius_start - radius) / (radius_start + 1e-8)).item()
-
-            curr_best = torch.min(c_fit)
-            start_best = torch.min(c_fit_start)
-            best_improve_rel = ((start_best - curr_best) / (torch.abs(start_best) + 1e-8)).item()
-            improve_ratio_stage = torch.mean((c_fit < c_fit_start).float()).item()
-            stag_ratio = torch.mean((c_stag >= 10).float()).item()
-            stag_growth = torch.mean((c_stag - c_stag_start).float()).item()
-
-            is_converged = (
-                radius_rel < 0.01
-                and radius_shrink > 0.40
-                and best_improve_rel < 5e-4
-                and improve_ratio_stage < 0.20
-            )
-            is_refining = (not is_converged) and (
-                radius_rel < 0.05
-                and radius_shrink > 0.20
-                and best_improve_rel < 2e-3
-            )
-
-            if is_converged:
-                converged[m] = True
-                converged_centers.append(center)
-                k = max(1, int(len(m) * guard_ratio))
-                local_order = torch.argsort(c_fit)
-                g_idx = m[local_order[:k]]
-                guardian[g_idx] = True
-                for idx in m[local_order[k:]]:
-                    release_pool.append(int(idx.item()))
-                status = "converged"
-            elif is_refining:
-                refining[m] = True
-                active_centers.append(center)
-                status = "refining"
-            else:
-                exploring[m] = True
-                active_centers.append(center)
-                score = (c_stag - c_stag_start).float() + 0.5 * (c_stag >= 10).float()
-                local_bad = m[torch.argsort(score, descending=True)]
-                topk = max(1, int(len(m) * min(0.4, 0.2 + 0.2 * float(intent_eff[4].item()))))
-                for idx in local_bad[:topk]:
-                    rescue_pool.append(int(idx.item()))
-                status = "exploring"
-
-            niche_tmp.append(
-                {
-                    "local_cluster_id": local_cid,
-                    "members": m,
-                    "size": int(len(m)),
-                    "status": status,
-                    "center": center,
-                    "center_norm": float(torch.norm(center).item()),
-                    "radius": float(radius.item()),
-                    "radius_rel": float(radius_rel),
-                    "radius_shrink": float(radius_shrink),
-                    "best_fit": float(curr_best.item()),
-                    "best_improve_rel": float(best_improve_rel),
-                    "accept_ratio_stage": float(improve_ratio_stage),
-                    "improve_ratio_stage": float(improve_ratio_stage),
-                    "stag_ratio": float(stag_ratio),
-                    "stag_growth": float(stag_growth),
-                }
-            )
-
-        stable_ids, stable_ages, n_new_niches = self._assign_stable_ids(centers, eps=eps)
-
-        # Build stable per-particle cluster ids.
-        cluster_ids = torch.full((n,), -1, dtype=torch.long, device=device)
-        for t, row in enumerate(niche_tmp):
-            cluster_ids[row["members"]] = stable_ids[t]
-
-        # Budgeted release and rescue.
-        release_budget = int(self.pop_size * float(intent_eff[3].item()) * (0.30 + 0.70 * float(intent_eff[0].item())))
-        rescue_budget = int(self.pop_size * float(intent_eff[4].item()))
-
-        if release_budget > 0 and len(release_pool) > 0:
-            release_sel = release_pool[: min(release_budget, len(release_pool))]
-            release[torch.tensor(release_sel, dtype=torch.long, device=device)] = True
-        if rescue_budget > 0 and len(rescue_pool) > 0:
-            rescue_sel = rescue_pool[: min(rescue_budget, len(rescue_pool))]
-            rescue[torch.tensor(rescue_sel, dtype=torch.long, device=device)] = True
-
-        rescue = rescue & (~guardian)
-        release = release & (~guardian)
-
-        archive_added = self._update_archive(converged_centers, min_dist=max(1e-6, 1.5 * eps))
-
-        if len(active_centers) == 0:
-            active_centers_t = torch.empty((0, self.dim), device=device)
-        else:
-            active_centers_t = torch.stack(active_centers, dim=0)
-
-        niche_rows: List[Dict] = []
-        for t, row in enumerate(niche_tmp):
-            m = row["members"]
-            center = row["center"]
-            if self.archive_centers.numel() == 0:
-                dist_archive_min = float("inf")
-            else:
-                dist_archive_min = float(torch.min(torch.norm(self.archive_centers - center.unsqueeze(0), dim=1)).item())
-
-            release_count = int(release[m].sum().item())
-            rescue_count = int(rescue[m].sum().item())
-            guardian_count = int(guardian[m].sum().item())
-
-            niche_rows.append(
-                {
-                    "niche_id": int(stable_ids[t]),
-                    "niche_age": int(stable_ages[t]),
-                    "size": int(row["size"]),
-                    "status": row["status"],
-                    "center_norm": row["center_norm"],
-                    "radius": row["radius"],
-                    "radius_rel": row["radius_rel"],
-                    "radius_shrink": row["radius_shrink"],
-                    "best_fit": row["best_fit"],
-                    "best_improve_rel": row["best_improve_rel"],
-                    "accept_ratio_stage": row["accept_ratio_stage"],
-                    "stag_ratio": row["stag_ratio"],
-                    "stag_growth": row["stag_growth"],
-                    "guardian_count": guardian_count,
-                    "release_count": release_count,
-                    "rescue_count": rescue_count,
-                    "dist_to_archive_min": dist_archive_min,
-                }
-            )
-
-        return NichePlan(
-            exploring_mask=exploring,
-            refining_mask=refining,
-            converged_mask=converged,
-            guardian_mask=guardian,
-            release_mask=release,
-            rescue_mask=rescue,
-            cluster_ids=cluster_ids,
-            active_centers=active_centers_t,
-            niche_rows=niche_rows,
-            n_new_niches=n_new_niches,
-            archive_added=archive_added,
-        )
-
-    def sample_release_positions(
-        self,
-        n: int,
-        lb: torch.Tensor,
-        ub: torch.Tensor,
-        avoid_centers: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if n <= 0:
-            return torch.empty((0, self.dim), device=self.device)
-
-        avoid = self.archive_centers
-        if avoid_centers is not None and avoid_centers.numel() > 0:
-            if avoid.numel() == 0:
-                avoid = avoid_centers
-            else:
-                avoid = torch.cat([avoid, avoid_centers], dim=0)
-
-        if avoid.numel() == 0:
-            return lb + torch.rand((n, self.dim), device=self.device) * (ub - lb)
-
-        low = lb
-        high = ub
-        span = torch.norm((ub - lb).squeeze(0)).item()
-        min_dist = max(1e-6, 0.10 * span / (self.dim ** 0.5))
-
-        out = []
-        needed = n
-        attempts = 0
-        while needed > 0 and attempts < 20:
-            cand = low + torch.rand((max(needed * 2, 8), self.dim), device=self.device) * (high - low)
-            d = torch.cdist(cand, avoid)
-            keep = torch.min(d, dim=1).values > min_dist
-            kept = cand[keep]
-            take = min(needed, kept.shape[0])
-            if take > 0:
-                out.append(kept[:take])
-                needed -= take
-            attempts += 1
-
-        if needed > 0:
-            out.append(low + torch.rand((needed, self.dim), device=self.device) * (high - low))
-        return torch.cat(out, dim=0)
-
-
-==================================================
-
-// [MODULE] File: rlec/rl/__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec/rl/networks.py
-----------------------------------------
-import torch
-import torch.nn as nn
-from torch.distributions import Normal
-
-
-class ActorMLP(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 32):  # 降至 32
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim)  # 去掉第二层隐藏层，加速拟合
-        )
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
-
-    def forward(self, state):
-        mean = self.net(state)
-        std = self.log_std.exp().expand_as(mean)
-        return Normal(mean, std)
-
-class CriticMLP(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, state):
-        return self.net(state)
-
-==================================================
-
-// [MODULE] File: rlec/rl/ppo.py
-----------------------------------------
-import torch
-import torch.nn as nn
-import numpy as np
-from .networks import ActorMLP, CriticMLP
-from .rollout_buffer import RolloutBuffer
-
-
-class PPO:
-    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
-                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.15,
-                 entropy_coef=0.002, k_epochs=2):
-        self.device = device
-        self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.k_epochs = k_epochs
-
-        self.actor = ActorMLP(state_dim, action_dim).to(device)
-        self.critic = CriticMLP(state_dim).to(device)
-
-        self.optimizer = torch.optim.Adam([
-            {'params': self.actor.parameters(), 'lr': lr_actor},
-            {'params': self.critic.parameters(), 'lr': lr_critic}
-        ])
-        self.buffer = RolloutBuffer(device)
-
-    def select_action(self, state: torch.Tensor, deterministic=False):
-        with torch.no_grad():
-            if state.dim() == 1:
-                state = state.unsqueeze(0)
-
-            dist = self.actor(state)
-            value = self.critic(state)
-            action_delta = dist.mean if deterministic else dist.sample()
-            log_prob = dist.log_prob(action_delta).sum(dim=-1)
-
-            # 动作平滑与安全先验 (Safe Prior)
-            # a_safe: [e=0.3, x=0.5, d=0.5, b=0.2, r=0.1, p=0.8] 提供稳健初始形态
-            a_safe = torch.tensor([0.3, 0.5, 0.5, 0.2, 0.1, 0.8], device=self.device)
-            epsilon = 0.2  # 最大允许网络偏离安全值的范围
-
-            # 使用 tanh 把网络输出压到 [-1, 1]，然后映射到微调区间
-            delta_scaled = torch.tanh(action_delta) * epsilon
-            intent_action = torch.clamp(a_safe + delta_scaled, 0.0, 1.0)
-
-        return (
-            action_delta.squeeze(0).cpu().numpy(),
-            intent_action.squeeze(0).cpu().numpy(),
-            log_prob.squeeze(0).item(),
-            value.squeeze(0).item()
-        )
-
-    def update(self):
-        if len(self.buffer.states) == 0: return {}
-
-        states = torch.stack(self.buffer.states).to(self.device)
-        actions = torch.stack(self.buffer.actions).to(self.device)
-        old_log_probs = torch.tensor(self.buffer.log_probs, device=self.device)
-
-        with torch.no_grad():
-            next_value = self.critic(states[-1:]).item()
-
-        returns, advantages = self.buffer.compute_gae(next_value, self.gamma)
-        actor_loss_list, critic_loss_list = [], []
-
-        for _ in range(self.k_epochs):
-            dist = self.actor(states)
-            log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-
-            ratios = torch.exp(log_probs - old_log_probs)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
-            values = self.critic(states).reshape(-1)
-            returns = returns.reshape(-1)
-            critic_loss = nn.MSELoss()(values, returns)
-
-            loss = actor_loss + 0.5 * critic_loss
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-            self.optimizer.step()
-
-            actor_loss_list.append(actor_loss.item())
-            critic_loss_list.append(critic_loss.item())
-
-        self.buffer.clear()
-        return {"actor_loss": np.mean(actor_loss_list), "critic_loss": np.mean(critic_loss_list)}
-
-==================================================
-
-// [MODULE] File: rlec/rl/rollout_buffer.py
-----------------------------------------
-import torch
-
-class RolloutBuffer:
-    """PPO 专用的 On-policy 轨迹缓冲池"""
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.clear()
-
-    def clear(self):
-        self.states, self.actions, self.rewards = [], [], []
-        self.values, self.log_probs, self.dones = [], [], []
-
-    def add(self, state, action, reward, value, log_prob, done):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-        self.dones.append(done)
-
-    def compute_gae(self, next_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
-        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
-        values = torch.tensor(self.values + [next_value], dtype=torch.float32, device=self.device)
-        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
-
-        advantages = torch.zeros(len(rewards), dtype=torch.float32, device=self.device)
-        last_gae = 0.0
-
-        for t in reversed(range(len(rewards))):
-            mask = 1.0 - dones[t]
-            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
-            advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
-
-        returns = advantages + values[:-1]
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return returns, advantages
-
-==================================================
-
-// [MODULE] File: rlec/utils/__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec/utils/niche_logger.py
-----------------------------------------
-from __future__ import annotations
-
-import csv
-import os
-from typing import Dict, List
-
-
-class NicheLogger:
-    def __init__(self, output_dir: str | None):
-        self.output_dir = output_dir
-        self.stage_rows: List[Dict] = []
-        self.niche_rows: List[Dict] = []
-
-    def log_stage(self, row: dict) -> None:
-        self.stage_rows.append(row)
-
-    def log_niches(self, rows: list[dict]) -> None:
-        if rows:
-            self.niche_rows.extend(rows)
-
-    def flush(self, stage_csv_path: str, niche_csv_path: str) -> None:
-        if self.output_dir is None:
-            return
-        os.makedirs(self.output_dir, exist_ok=True)
-        self._write_csv(stage_csv_path, self.stage_rows)
-        self._write_csv(niche_csv_path, self.niche_rows)
-
-    @staticmethod
-    def _write_csv(path: str, rows: List[Dict]) -> None:
-        if len(rows) == 0:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write("")
-            return
-        fieldnames = list(rows[0].keys())
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-
-
-==================================================
-
-// [MODULE] File: rlec/utils/population_metrics.py
-----------------------------------------
-import torch
-
-
-def compute_diversity(pop: torch.Tensor) -> torch.Tensor:
-    return torch.std(pop, dim=0).mean()
-
-
-def compute_fitness_skewness(fit: torch.Tensor) -> torch.Tensor:
-    mean = fit.mean()
-    std = fit.std() + 1e-8
-    skewness = torch.mean(((fit - mean) / std) ** 3)
-    return torch.clamp(skewness, -5.0, 5.0)
-
-
-def compute_rank_entropy(fit: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    norm_fit = (fit - fit.mean()) / (fit.std() + 1e-8)
-    probs = torch.softmax(-norm_fit / temperature, dim=0)
-    entropy = -(probs * torch.log(probs + 1e-8)).sum()
-    max_entropy = torch.log(torch.tensor(float(fit.shape[0]), device=fit.device))
-    return entropy / max_entropy
-
-
-def compute_stagnation_ratio(stagnation: torch.Tensor, threshold: int = 10) -> torch.Tensor:
-    stagnant_count = (stagnation >= threshold).sum().float()
-    return stagnant_count / stagnation.shape[0]
-
-
-# 【必须改 4】：新增聚类分离度特征，识别种群是否塌缩为单峰
-def compute_elite_separation(pop: torch.Tensor, fit: torch.Tensor, q: float = 0.1) -> torch.Tensor:
-    """计算精英簇与其他个体之间的分离度 (分离度越高，说明盆地越多/结构越清晰)"""
-    N = pop.shape[0]
-    k = max(1, int(N * q))
-
-    _, indices = torch.sort(fit)
-    elite_idx = indices[:k]
-    non_elite_idx = indices[k:]
-
-    elite_pop = pop[elite_idx]
-    non_elite_pop = pop[non_elite_idx]
-
-    # 找到精英簇的中心点
-    elite_center = elite_pop.mean(dim=0)
-
-    # 精英簇内部的紧凑度
-    elite_spread = torch.norm(elite_pop - elite_center, dim=1).mean()
-    # 大众个体离精英中心的平均距离
-    separation = torch.norm(non_elite_pop - elite_center, dim=1).mean()
-
-    # 比例越大，说明种群不仅有精英，还有大量个体在远方探索 (多模态结构)
-    return separation / (elite_spread + 1e-8)
-
-==================================================
-
-// [MODULE] File: rlec/algorithms/__init__.py
-----------------------------------------
-
-
-==================================================
-
-// [MODULE] File: rlec/algorithms/code_rlec.py
+// [MODULE] File: rlec\algorithms\code_rlec.py
 ----------------------------------------
 ﻿from typing import Optional
 
@@ -1255,7 +308,7 @@ def make_rlec_code(
 
 ==================================================
 
-// [MODULE] File: rlec/algorithms/rlec_wrapper.py
+// [MODULE] File: rlec\algorithms\rlec_wrapper.py
 ----------------------------------------
 ﻿from __future__ import annotations
 
@@ -1306,7 +359,20 @@ class RLECWrapper(Algorithm):
         self.state_builder = MacroStateBuilder(self.dim, self.pop_size)
         self.reward_calc = StageRewardCalculator()
         self.interpreter = ControlInterpreter(self.pop_size)
-        self.niche_manager = NicheManager(self.pop_size, self.dim, self.device)
+        self.niche_manager = NicheManager(
+            self.pop_size,
+            self.dim,
+            self.device,
+            r_small=0.01,
+            r_shrink=0.40,
+            improve_eps=5e-4,
+            improve_ratio_eps=0.20,
+            complete_patience=2,
+            merge_dist=0.08,
+            merge_fit_eps=1e-2,
+            max_anchor_niches=2,
+            anchor_scale=0.20,
+        )
 
         self.rl_agent = PPO(state_dim=self.state_builder.state_dim, action_dim=6, device=self.device)
 
@@ -1343,7 +409,11 @@ class RLECWrapper(Algorithm):
         self.current_cmd_scales = Mutable(torch.ones(self.pop_size, device=self.device))
 
         self.current_niche_guardian = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
-        self.current_niche_converged = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_anchor = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_completed = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_scout = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_anchor_budget = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_scout_budget = Mutable(torch.tensor(0.0, device=self.device))
 
         self.current_gate_refine = Mutable(torch.tensor(0.0, device=self.device))
         self.current_gate_recover = Mutable(torch.tensor(0.0, device=self.device))
@@ -1356,13 +426,16 @@ class RLECWrapper(Algorithm):
         self.last_rescue_success = Mutable(torch.tensor(0.0, device=self.device))
         self.last_elite_damage = Mutable(torch.tensor(0.0, device=self.device))
 
-        self.niche_summary_vec = Mutable(torch.zeros(8, device=self.device))
-        self.last_niche_reward_stats = Mutable(torch.zeros(5, device=self.device))
+        self.niche_summary_vec = Mutable(torch.zeros(12, device=self.device))
+        self.last_niche_reward_stats = Mutable(torch.zeros(8, device=self.device))
 
         self.last_n_niches = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_exploring = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_refining = Mutable(torch.tensor(0.0, device=self.device))
-        self.last_n_converged = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_completed = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_anchor = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_scout = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_overlap_groups = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_guardians = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_release = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_rescue = Mutable(torch.tensor(0.0, device=self.device))
@@ -1374,6 +447,8 @@ class RLECWrapper(Algorithm):
         self.last_release_birth_pop = Mutable(torch.zeros((self.pop_size, self.dim), device=self.device))
         self.stage_guardian_mask = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.stage_guardian_start_best = Mutable(torch.tensor(torch.inf, device=self.device))
+        self.stage_anchor_mask = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.stage_anchor_start_best = Mutable(torch.tensor(torch.inf, device=self.device))
 
     @property
     def pop(self):
@@ -1435,20 +510,40 @@ class RLECWrapper(Algorithm):
             largest_ratio = max(row["size"] for row in niche_plan.niche_rows) / self.pop_size
             mean_radius_rel = sum(row["radius_rel"] for row in niche_plan.niche_rows) / len(niche_plan.niche_rows)
 
-        n_exploring = len([r for r in niche_plan.niche_rows if r["status"] == "exploring"])
+        n_exploring = len(
+            [r for r in niche_plan.niche_rows if r["status"] == "exploring" and not r.get("is_overlap_redundant", False)]
+        )
         n_refining = len([r for r in niche_plan.niche_rows if r["status"] == "refining"])
-        n_converged = len([r for r in niche_plan.niche_rows if r["status"] == "converged"])
+        n_completed = len([r for r in niche_plan.niche_rows if r["status"] == "completed"])
+        group_count = {}
+        for row in niche_plan.niche_rows:
+            gid = row.get("overlap_group_id", -1)
+            group_count[gid] = group_count.get(gid, 0) + 1
+        overlap_groups = {gid for gid, cnt in group_count.items() if gid >= 0 and cnt > 1}
+        overlap_niches = len([r for r in niche_plan.niche_rows if r.get("is_overlap_redundant", False)])
+        n_anchor = len([r for r in niche_plan.niche_rows if r.get("is_anchor", False)])
+        n_scout = len([r for r in niche_plan.niche_rows if r.get("role", "") == "scout"])
+        n_guardians = int(niche_plan.guardian_mask.sum().item())
+
+        anchor_ratio = float(niche_plan.anchor_mask.float().mean().item())
+        scout_ratio = float(niche_plan.scout_mask.float().mean().item())
+        completed_ratio = (n_completed / n_niches) if n_niches > 0 else 0.0
+        overlap_ratio = (overlap_niches / n_niches) if n_niches > 0 else 0.0
 
         summary = torch.tensor(
             [
                 len(niche_plan.niche_rows) / self.pop_size,
                 largest_ratio,
                 n_refining / n_niches,
-                n_converged / n_niches,
+                n_completed / n_niches,
                 float(self.last_n_release.item()) / self.pop_size,
-                float(self.last_n_guardians.item()) / self.pop_size,
+                n_guardians / self.pop_size,
                 min(1.0, float(self.niche_manager.archive_centers.shape[0]) / self.pop_size),
                 mean_radius_rel,
+                anchor_ratio,
+                scout_ratio,
+                completed_ratio,
+                overlap_ratio,
             ],
             dtype=torch.float32,
             device=self.device,
@@ -1457,7 +552,10 @@ class RLECWrapper(Algorithm):
         self.last_n_niches = torch.tensor(float(len(niche_plan.niche_rows)), device=self.device)
         self.last_n_exploring = torch.tensor(float(n_exploring), device=self.device)
         self.last_n_refining = torch.tensor(float(n_refining), device=self.device)
-        self.last_n_converged = torch.tensor(float(n_converged), device=self.device)
+        self.last_n_completed = torch.tensor(float(n_completed), device=self.device)
+        self.last_n_anchor = torch.tensor(float(n_anchor), device=self.device)
+        self.last_n_scout = torch.tensor(float(n_scout), device=self.device)
+        self.last_n_overlap_groups = torch.tensor(float(len(overlap_groups)), device=self.device)
 
         return summary
 
@@ -1487,11 +585,21 @@ class RLECWrapper(Algorithm):
             "n_niches": int(self.last_n_niches.item()),
             "n_exploring": int(self.last_n_exploring.item()),
             "n_refining": int(self.last_n_refining.item()),
-            "n_converged": int(self.last_n_converged.item()),
+            "n_completed": int(self.last_n_completed.item()),
+            "n_anchor": int(self.last_n_anchor.item()),
+            "n_scout": int(self.last_n_scout.item()),
+            "n_overlap_groups": int(self.last_n_overlap_groups.item()),
             "n_guardians": int(self.last_n_guardians.item()),
             "n_release": int(self.last_n_release.item()),
             "n_rescue": int(self.last_n_rescue.item()),
             "archive_size": int(self.niche_manager.archive_centers.shape[0]),
+            "anchor_ratio": float(self.niche_summary_vec[8].item()),
+            "scout_ratio": float(self.niche_summary_vec[9].item()),
+            "completed_ratio": float(self.niche_summary_vec[10].item()),
+            "overlap_ratio": float(self.niche_summary_vec[11].item()),
+            "scout_birth_efficiency": float(self.last_niche_reward_stats[6].item()),
+            "anchor_stability": float(self.last_niche_reward_stats[5].item()),
+            "overlap_penalty": float(self.last_niche_reward_stats[7].item()),
             "intervene_ratio": float(self.last_intervene_ratio.item()),
             "accept_ratio": float(self.last_accept_ratio.item()),
             "rescue_success": float(self.last_rescue_success.item()),
@@ -1510,6 +618,7 @@ class RLECWrapper(Algorithm):
                 "niche_age": row["niche_age"],
                 "size": row["size"],
                 "status": row["status"],
+                "role": row.get("role", row["status"]),
                 "center_norm": row["center_norm"],
                 "radius": row["radius"],
                 "radius_rel": row["radius_rel"],
@@ -1524,6 +633,11 @@ class RLECWrapper(Algorithm):
                 "release_count": row["release_count"],
                 "rescue_count": row["rescue_count"],
                 "dist_to_archive_min": row["dist_to_archive_min"],
+                "overlap_group_id": row.get("overlap_group_id", -1),
+                "is_overlap_redundant": row.get("is_overlap_redundant", False),
+                "completion_counter": row.get("completion_counter", 0),
+                "is_anchor": row.get("is_anchor", False),
+                "is_guardian": row.get("is_guardian", False),
             }
             niche_rows.append(out)
         self.niche_logger.log_niches(niche_rows)
@@ -1594,22 +708,11 @@ class RLECWrapper(Algorithm):
         self.current_gate_refine = g_refine.detach()
         self.current_gate_recover = g_recover.detach()
 
-        cmd = self.interpreter.interpret(intent_eff_obj, current_fit, self.stagnation, float(self.initial_div.item()))
-
         self.last_action_raw = torch.tensor(action_raw, device=self.device, dtype=torch.float32)
         self.last_intent = intent_tensor.clone()
         self.last_intent_eff = intent_eff_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
         self.last_value = torch.tensor(value, device=self.device, dtype=torch.float32)
-
-        self.current_cmd_protected = cmd.protected_mask.clone()
-        self.current_cmd_middle = cmd.middle_mask.clone()
-        self.current_cmd_quiet = cmd.quiet_mask.clone()
-        self.current_cmd_rescue = cmd.rescue_mask.clone()
-        self.current_cmd_scales = cmd.step_scales.clone()
-        self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
-        self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
-        self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
 
         niche_plan = self.niche_manager.plan(
             pop=current_pop,
@@ -1622,11 +725,49 @@ class RLECWrapper(Algorithm):
             initial_div=float(self.initial_div.item()),
         )
 
-        self.current_niche_guardian = niche_plan.guardian_mask.clone()
-        self.current_niche_converged = niche_plan.converged_mask.clone()
+        cmd = self.interpreter.interpret(
+            intent_eff_obj,
+            current_fit,
+            self.stagnation,
+            float(self.initial_div.item()),
+            niche_roles={
+                "anchor_mask": niche_plan.anchor_mask,
+                "scout_mask": niche_plan.scout_mask,
+                "completed_mask": niche_plan.completed_mask,
+                "guardian_mask": niche_plan.guardian_mask,
+            },
+        )
 
-        self.current_cmd_protected = self.current_cmd_protected | niche_plan.guardian_mask
-        self.current_cmd_quiet = self.current_cmd_quiet | niche_plan.guardian_mask
+        self.current_cmd_protected = cmd.protected_mask.clone()
+        self.current_cmd_middle = cmd.middle_mask.clone()
+        self.current_cmd_quiet = cmd.quiet_mask.clone()
+        self.current_cmd_rescue = cmd.rescue_mask.clone()
+        self.current_cmd_scales = cmd.step_scales.clone()
+        self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
+        self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
+        self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
+
+        self.current_niche_guardian = niche_plan.guardian_mask.clone()
+        self.current_niche_anchor = niche_plan.anchor_mask.clone()
+        self.current_niche_completed = niche_plan.completed_mask.clone()
+        self.current_niche_scout = niche_plan.scout_mask.clone()
+
+        self.current_anchor_budget = torch.tensor(
+            float(niche_plan.anchor_mask.sum().item()) / max(1.0, float(self.pop_size)),
+            device=self.device,
+        )
+        self.current_scout_budget = torch.tensor(
+            float(niche_plan.scout_mask.sum().item()) / max(1.0, float(self.pop_size)),
+            device=self.device,
+        )
+
+        anchor_mask = niche_plan.anchor_mask
+        anchor_guardian = niche_plan.guardian_mask & anchor_mask
+        completed_non_guardian = niche_plan.completed_mask & (~niche_plan.guardian_mask)
+
+        self.current_cmd_protected = self.current_cmd_protected | anchor_mask
+        self.current_cmd_quiet = self.current_cmd_quiet & (~anchor_mask)
+        self.current_cmd_quiet[anchor_guardian] = True
 
         role_active = niche_plan.exploring_mask | niche_plan.refining_mask
         self.current_cmd_middle = self.current_cmd_middle & role_active & (~niche_plan.guardian_mask)
@@ -1634,16 +775,18 @@ class RLECWrapper(Algorithm):
             self.current_cmd_rescue
             & niche_plan.rescue_mask
             & niche_plan.exploring_mask
+            & (~anchor_mask)
             & (~niche_plan.guardian_mask)
         )
 
         self.current_cmd_scales[niche_plan.refining_mask] = self.current_cmd_scales[niche_plan.refining_mask] * 0.55
-
-        converged_non_guardian = niche_plan.converged_mask & (~niche_plan.guardian_mask)
-        self.current_cmd_middle[converged_non_guardian] = False
-        self.current_cmd_rescue[converged_non_guardian] = False
-        self.current_cmd_scales[converged_non_guardian] = 0.0
-        self.current_cmd_quiet[converged_non_guardian] = False
+        self.current_cmd_scales[anchor_mask] = self.current_cmd_scales[anchor_mask] * self.niche_manager.anchor_scale
+        self.current_cmd_middle[anchor_guardian] = False
+        self.current_cmd_rescue[anchor_mask] = False
+        self.current_cmd_middle[completed_non_guardian] = False
+        self.current_cmd_rescue[completed_non_guardian] = False
+        self.current_cmd_protected[niche_plan.scout_mask] = False
+        self.current_cmd_quiet[niche_plan.scout_mask] = False
 
         self.current_cmd_alpha_margin = self.current_cmd_alpha_margin * (1.0 - 0.4 * g_refine)
         self.current_cmd_beta_margin = self.current_cmd_beta_margin * (1.0 - 0.4 * g_refine)
@@ -1653,11 +796,17 @@ class RLECWrapper(Algorithm):
         self.last_release_baseline_fit = torch.zeros(self.pop_size, device=self.device)
 
         if release_idx.numel() > 0:
+            if niche_plan.active_centers.numel() > 0 and niche_plan.anchor_centers.numel() > 0:
+                avoid_centers = torch.cat([niche_plan.active_centers, niche_plan.anchor_centers], dim=0)
+            elif niche_plan.anchor_centers.numel() > 0:
+                avoid_centers = niche_plan.anchor_centers
+            else:
+                avoid_centers = niche_plan.active_centers
             new_pos = self.niche_manager.sample_release_positions(
                 int(release_idx.numel()),
                 self.lb,
                 self.ub,
-                avoid_centers=niche_plan.active_centers,
+                avoid_centers=avoid_centers,
             )
             self.base.pop[release_idx] = new_pos
             self.base.fit[release_idx] = self.evaluate(new_pos)
@@ -1666,8 +815,10 @@ class RLECWrapper(Algorithm):
             self.prev_pop[release_idx] = self.base.pop[release_idx]
             self.prev_fit[release_idx] = self.base.fit[release_idx]
 
-            self.current_niche_converged[release_idx] = False
+            self.current_niche_completed[release_idx] = False
             self.current_niche_guardian[release_idx] = False
+            self.current_niche_anchor[release_idx] = False
+            self.current_niche_scout[release_idx] = True
             self.current_cmd_quiet[release_idx] = False
             self.current_cmd_protected[release_idx] = False
             self.current_cmd_rescue[release_idx] = False
@@ -1704,6 +855,9 @@ class RLECWrapper(Algorithm):
                 stage_repeat_ratio,
                 0.0,
                 0.0,
+                0.0,
+                0.0,
+                float(self.niche_summary_vec[11].item()),
             ],
             device=self.device,
             dtype=torch.float32,
@@ -1713,11 +867,16 @@ class RLECWrapper(Algorithm):
         self.stage_start_fit = self.base.fit.clone()
         self.stage_start_div = current_div
         self.stage_start_stagnation = self.stagnation.clone()
-        self.stage_guardian_mask = self.current_niche_guardian.clone()
+        self.stage_guardian_mask = (self.current_niche_guardian & self.current_niche_anchor).clone()
         if self.stage_guardian_mask.any():
             self.stage_guardian_start_best = torch.min(self.base.fit[self.stage_guardian_mask]).clone()
         else:
             self.stage_guardian_start_best = torch.tensor(torch.inf, device=self.device)
+        self.stage_anchor_mask = self.current_niche_anchor.clone()
+        if self.stage_anchor_mask.any():
+            self.stage_anchor_start_best = torch.min(self.base.fit[self.stage_anchor_mask]).clone()
+        else:
+            self.stage_anchor_start_best = torch.tensor(torch.inf, device=self.device)
 
         self._log_stage_and_niches(current_div, niche_plan, self.last_intent_eff)
         self.stage_counter = self.stage_counter + 1
@@ -1779,9 +938,27 @@ class RLECWrapper(Algorithm):
             else:
                 guardian_stability = 0.0
 
+            anchor_mask = self.stage_anchor_mask
+            if anchor_mask.any():
+                curr_anchor_best = torch.min(self.base.fit[anchor_mask])
+                start_anchor_best = self.stage_anchor_start_best
+                anchor_improve = (start_anchor_best - curr_anchor_best) / (torch.abs(start_anchor_best) + 1e-8)
+                anchor_stability = float(torch.clamp(0.5 + 0.5 * anchor_improve, 0.0, 1.0).item())
+            else:
+                anchor_stability = 0.0
+
+            scout_birth_efficiency = 0.0
+            if release_count > 0:
+                scout_birth_efficiency = float(min(1.0, release_efficiency * (1.0 + self.last_niche_reward_stats[0].item())))
+
+            overlap_penalty = float(torch.clamp(self.niche_summary_vec[11], 0.0, 1.0).item())
+
             niche_stats = self.last_niche_reward_stats.clone()
             niche_stats[3] = guardian_stability
             niche_stats[4] = release_efficiency
+            niche_stats[5] = anchor_stability
+            niche_stats[6] = scout_birth_efficiency
+            niche_stats[7] = overlap_penalty
 
             reward = self.reward_calc.calculate(
                 fit_start=old_stage_start_fit,
@@ -1817,7 +994,7 @@ class RLECWrapper(Algorithm):
         curr_pop = self.base.pop.clone()
         curr_fit = self.base.fit.clone()
 
-        guardian_mask = self.current_niche_guardian
+        guardian_mask = self.current_niche_guardian & self.current_niche_anchor
         if guardian_mask.any():
             curr_pop[guardian_mask] = self.prev_pop[guardian_mask]
             curr_fit[guardian_mask] = self.prev_fit[guardian_mask]
@@ -1923,6 +1100,1295 @@ class RLECWrapper(Algorithm):
         niche_csv = os.path.join(self.log_dir, f"F{fid}_run{rid}_niche_log.csv")
         self.niche_logger.flush(stage_csv, niche_csv)
 
+
+==================================================
+
+// [MODULE] File: rlec\control\__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec\control\intent_vector.py
+----------------------------------------
+import torch
+from dataclasses import dataclass
+
+
+@dataclass
+class IntentVector:
+    """
+    RLEC 战略意图向量 (6D)
+    所有值均被规范化到 [0, 1] 范围内
+    """
+    e_t: float  # Exploration pressure (探索压力): 鼓励大跨度搜索，容忍变差
+    x_t: float  # Exploitation pressure (开发压力): 鼓励局部微调，严格要求提升
+    d_t: float  # Diversity target (多样性目标): 0.0 代表允许坍缩，1.0 代表极度分散
+    b_t: float  # Intervention budget (干预预算): 本阶段允许干预的最大个体比例
+    r_t: float  # Rescue budget (脱困预算): 给停滞个体分配的重构资源比例
+    p_t: float  # Elite protection (精英保护): 精英个体免受随机扰动的保护强度
+
+    @classmethod
+    def from_tensor(cls, action_tensor: torch.Tensor) -> 'IntentVector':
+        """
+        将 PPO 网络的输出（通常在 [-1, 1] 之间）映射到 [0, 1] 的物理意图区间
+        """
+        a = torch.clamp(action_tensor.squeeze(), 0.0, 1.0).tolist()
+
+        return cls(
+            e_t=a[0], x_t=a[1], d_t=a[2],
+            b_t=a[3], r_t=a[4], p_t=a[5]
+        )
+
+    def __repr__(self):
+        return (f"Intent[Explor:{self.e_t:.2f}, Exploit:{self.x_t:.2f}, Div:{self.d_t:.2f}, "
+                f"Budget:{self.b_t:.2f}, Rescue:{self.r_t:.2f}, Elite:{self.p_t:.2f}]")
+
+==================================================
+
+// [MODULE] File: rlec\control\interpreter.py
+----------------------------------------
+import torch
+from dataclasses import dataclass
+from typing import Dict, Optional
+from .intent_vector import IntentVector
+
+
+@dataclass
+class EACommand:
+    protected_mask: torch.Tensor
+    rescue_mask: torch.Tensor
+    middle_mask: torch.Tensor
+    quiet_mask: torch.Tensor
+    step_scales: torch.Tensor
+    alpha_margin: float
+    beta_margin: float
+    target_diversity: float
+
+
+class ControlInterpreter:
+    def __init__(self, pop_size: int, max_stagnation: int = 10):
+        self.pop_size = pop_size
+        self.max_stag = max_stagnation
+
+    def interpret(
+        self,
+        intent: IntentVector,
+        fit: torch.Tensor,
+        stagnation: torch.Tensor,
+        initial_div: float,
+        niche_roles: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> EACommand:
+        device = fit.device
+        n = self.pop_size
+
+        anchor_mask = None
+        scout_mask = None
+        completed_mask = None
+        guardian_mask = None
+        if niche_roles is not None:
+            anchor_mask = niche_roles.get("anchor_mask")
+            scout_mask = niche_roles.get("scout_mask")
+            completed_mask = niche_roles.get("completed_mask")
+            guardian_mask = niche_roles.get("guardian_mask")
+
+        # Lower fit is better. rank_percentile: 0 -> best, 1 -> worst
+        _, rank_idx = torch.sort(fit, descending=True)
+        rank_percentile = torch.empty(n, device=device)
+        rank_percentile[rank_idx] = torch.arange(n, dtype=torch.float32, device=device) / (n - 1)
+
+        fit_std = torch.std(fit) + 1e-8
+        best_fit = torch.min(fit)
+        norm_gap_to_best = (fit - best_fit) / fit_std
+        near_best_mask = norm_gap_to_best < 0.5
+        good_stagnation_mask = (stagnation >= self.max_stag) & (rank_percentile < 0.3) & near_best_mask
+
+        mid_pref = 1.0 - torch.abs(rank_percentile - 0.5) * 2.0
+        bad_stagnation = (stagnation / self.max_stag) * rank_percentile
+        score = 0.55 * bad_stagnation + 0.30 * mid_pref + 0.15 * rank_percentile
+
+        n_intervene = int(n * intent.b_t)
+        intervene_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        if n_intervene > 0:
+            _, intervene_idx = torch.topk(score, n_intervene)
+            intervene_mask[intervene_idx] = True
+
+        if scout_mask is not None and scout_mask.any() and n_intervene > 0:
+            extra = max(1, int(0.15 * n_intervene))
+            scout_score = score.clone()
+            scout_score[~scout_mask] = -1e9
+            _, scout_idx = torch.topk(scout_score, min(extra, int(scout_mask.sum().item())))
+            intervene_mask[scout_idx] = True
+
+        intervene_mask = intervene_mask & (~good_stagnation_mask)
+
+        k_elite = max(1, int(n * 0.10 * intent.p_t))
+        _, sorted_indices = torch.sort(fit)
+        protected_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        if intent.p_t > 0.05:
+            protected_mask[sorted_indices[:k_elite]] = True
+
+        intervene_mask = intervene_mask & (~protected_mask)
+
+        num_rescue = int(n_intervene * intent.r_t)
+        rescue_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        if num_rescue > 0:
+            rescue_priority = stagnation.clone()
+            rescue_priority[~intervene_mask] = -1.0
+            rescue_priority[good_stagnation_mask] = -1.0
+            rescue_priority[rank_percentile < 0.3] = -1.0
+            if scout_mask is not None:
+                rescue_priority = rescue_priority + 1.0 * scout_mask.float()
+            _, rescue_idx = torch.topk(rescue_priority, num_rescue)
+            rescue_mask[rescue_idx] = True
+
+        rescue_mask = rescue_mask & (~protected_mask)
+        middle_mask = intervene_mask & (~rescue_mask) & (~protected_mask)
+
+        if anchor_mask is not None:
+            rescue_mask = rescue_mask & (~anchor_mask)
+            protected_mask = protected_mask | anchor_mask
+            middle_mask = middle_mask & (~(anchor_mask & (guardian_mask if guardian_mask is not None else anchor_mask)))
+
+        if completed_mask is not None and guardian_mask is not None:
+            completed_non_guard = completed_mask & (~guardian_mask)
+            rescue_mask = rescue_mask & (~completed_non_guard)
+            middle_mask = middle_mask & (~completed_non_guard)
+
+        global_scale = 1.0 + 2.0 * intent.e_t
+        step_scales = torch.ones(n, device=device)
+        step_scales[middle_mask] = 1.0 + intent.e_t - 0.5 * intent.x_t
+        step_scales[rescue_mask] = global_scale
+
+        if anchor_mask is not None:
+            step_scales[anchor_mask] = step_scales[anchor_mask] * 0.3
+        if scout_mask is not None:
+            step_scales[scout_mask & middle_mask] = step_scales[scout_mask & middle_mask] * 1.15
+            step_scales[scout_mask & rescue_mask] = step_scales[scout_mask & rescue_mask] * 1.20
+
+        alpha_margin = 0.02 * intent.e_t - 0.02 * intent.x_t
+        beta_margin = 1e-5 * intent.e_t - 1e-5 * intent.x_t
+        target_diversity = initial_div * intent.d_t
+
+        return EACommand(
+            protected_mask=protected_mask,
+            rescue_mask=rescue_mask,
+            middle_mask=middle_mask,
+            quiet_mask=good_stagnation_mask,
+            step_scales=step_scales,
+            alpha_margin=alpha_margin,
+            beta_margin=beta_margin,
+            target_diversity=target_diversity,
+        )
+
+
+==================================================
+
+// [MODULE] File: rlec\control\niche_manager.py
+----------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import torch
+
+
+@dataclass
+class NichePlan:
+    exploring_mask: torch.Tensor
+    refining_mask: torch.Tensor
+    completed_mask: torch.Tensor
+    anchor_mask: torch.Tensor
+    scout_mask: torch.Tensor
+    guardian_mask: torch.Tensor
+    release_mask: torch.Tensor
+    rescue_mask: torch.Tensor
+    cluster_ids: torch.Tensor
+    overlap_group_ids: torch.Tensor
+    active_centers: torch.Tensor
+    anchor_centers: torch.Tensor
+    completed_centers: torch.Tensor
+    niche_rows: List[Dict]
+    n_new_niches: int
+    archive_added: int
+
+
+class NicheManager:
+    """Niche-level lifecycle planner with stable IDs, completion patience, overlap merge, and scout release."""
+
+    def __init__(
+        self,
+        pop_size: int,
+        dim: int,
+        device: torch.device,
+        r_small: float = 0.01,
+        r_shrink: float = 0.40,
+        improve_eps: float = 5e-4,
+        improve_ratio_eps: float = 0.20,
+        complete_patience: int = 2,
+        merge_dist: float = 0.08,
+        merge_fit_eps: float = 1e-2,
+        max_anchor_niches: int = 2,
+        anchor_scale: float = 0.20,
+        release_exploring_stag: float = 16.0,
+        completed_guardian_cap: int = 2,
+    ):
+        self.pop_size = pop_size
+        self.dim = dim
+        self.device = device
+        self.r_small = r_small
+        self.r_shrink = r_shrink
+        self.improve_eps = improve_eps
+        self.improve_ratio_eps = improve_ratio_eps
+        self.complete_patience = complete_patience
+        self.merge_dist = merge_dist
+        self.merge_fit_eps = merge_fit_eps
+        self.max_anchor_niches = max_anchor_niches
+        self.anchor_scale = anchor_scale
+        self.release_exploring_stag = release_exploring_stag
+        self.completed_guardian_cap = completed_guardian_cap
+
+        self.archive_centers = torch.empty((0, dim), device=device)
+        self.archive_best_fit: List[float] = []
+        self.archive_age: List[int] = []
+
+        self.prev_centers = torch.empty((0, dim), device=device)
+        self.prev_ids: List[int] = []
+        self.prev_ages: List[int] = []
+        self.prev_status_by_id: Dict[int, str] = {}
+        self.prev_complete_counter: Dict[int, int] = {}
+        self.next_niche_id = 0
+
+    def _cluster(self, pop: torch.Tensor, fit: torch.Tensor, eps: float) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        n = pop.shape[0]
+        cluster_ids = torch.full((n,), -1, dtype=torch.long, device=pop.device)
+        order = torch.argsort(fit)  # best-first
+        cid = 0
+        for idx in order:
+            i = int(idx.item())
+            if cluster_ids[i] != -1:
+                continue
+            d = torch.norm(pop - pop[i], dim=1)
+            members = (d <= eps) & (cluster_ids == -1)
+            cluster_ids[members] = cid
+            cid += 1
+
+        clusters: List[torch.Tensor] = []
+        for k in range(cid):
+            clusters.append(torch.where(cluster_ids == k)[0])
+        return cluster_ids, clusters
+
+    def _update_archive(
+        self,
+        centers: List[torch.Tensor],
+        best_fits: List[float],
+        ages: List[int],
+        min_dist: float,
+    ) -> int:
+        added = 0
+        for idx, c in enumerate(centers):
+            if self.archive_centers.numel() == 0:
+                self.archive_centers = c.unsqueeze(0)
+                self.archive_best_fit.append(float(best_fits[idx]))
+                self.archive_age.append(int(ages[idx]))
+                added += 1
+                continue
+            d = torch.norm(self.archive_centers - c.unsqueeze(0), dim=1)
+            if torch.min(d).item() > min_dist:
+                self.archive_centers = torch.cat([self.archive_centers, c.unsqueeze(0)], dim=0)
+                self.archive_best_fit.append(float(best_fits[idx]))
+                self.archive_age.append(int(ages[idx]))
+                added += 1
+        return added
+
+    def _assign_stable_ids(self, centers: List[torch.Tensor], eps: float) -> Tuple[List[int], List[int], int]:
+        if len(centers) == 0:
+            self.prev_centers = torch.empty((0, self.dim), device=self.device)
+            self.prev_ids = []
+            self.prev_ages = []
+            return [], [], 0
+
+        if self.prev_centers.numel() == 0:
+            ids = []
+            ages = []
+            for _ in centers:
+                ids.append(self.next_niche_id)
+                ages.append(1)
+                self.next_niche_id += 1
+            self.prev_centers = torch.stack(centers, dim=0)
+            self.prev_ids = ids
+            self.prev_ages = ages
+            return ids, ages, len(ids)
+
+        curr = torch.stack(centers, dim=0)
+        d = torch.cdist(curr, self.prev_centers)
+        match_dist = max(1e-6, 1.5 * eps)
+
+        ids = [-1] * len(centers)
+        ages = [1] * len(centers)
+        used_prev = set()
+
+        flat = []
+        for i in range(d.shape[0]):
+            for j in range(d.shape[1]):
+                flat.append((float(d[i, j].item()), i, j))
+        flat.sort(key=lambda x: x[0])
+        for dist_ij, i, j in flat:
+            if dist_ij > match_dist:
+                break
+            if ids[i] != -1 or j in used_prev:
+                continue
+            ids[i] = self.prev_ids[j]
+            ages[i] = self.prev_ages[j] + 1
+            used_prev.add(j)
+
+        new_count = 0
+        for i in range(len(ids)):
+            if ids[i] == -1:
+                ids[i] = self.next_niche_id
+                ages[i] = 1
+                self.next_niche_id += 1
+                new_count += 1
+
+        self.prev_centers = curr
+        self.prev_ids = ids
+        self.prev_ages = ages
+        return ids, ages, new_count
+
+    def _detect_overlap_groups(
+        self,
+        centers: torch.Tensor,
+        best_fit: torch.Tensor,
+        merge_dist: float,
+        merge_fit_eps: float,
+    ) -> torch.Tensor:
+        if centers.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+
+        n = centers.shape[0]
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        dist_mat = torch.cdist(centers, centers)
+        for i in range(n):
+            for j in range(i + 1, n):
+                cond_a = float(dist_mat[i, j].item()) < merge_dist
+                denom = max(abs(float(best_fit[i].item())), abs(float(best_fit[j].item())), 1e-8)
+                fit_rel = abs(float(best_fit[i].item()) - float(best_fit[j].item())) / denom
+                cond_b = fit_rel < merge_fit_eps
+                if cond_a and cond_b:
+                    union(i, j)
+
+        root_to_gid: Dict[int, int] = {}
+        next_gid = 0
+        group_ids = torch.full((n,), -1, dtype=torch.long, device=self.device)
+        for i in range(n):
+            r = find(i)
+            if r not in root_to_gid:
+                root_to_gid[r] = next_gid
+                next_gid += 1
+            group_ids[i] = root_to_gid[r]
+        return group_ids
+
+    def _update_completion_counter(
+        self,
+        stable_ids: List[int],
+        complete_signal: List[bool],
+        patience: int,
+    ) -> Tuple[List[bool], List[int]]:
+        completed: List[bool] = []
+        counters: List[int] = []
+        alive_ids = set(stable_ids)
+
+        for sid, signal in zip(stable_ids, complete_signal):
+            prev = self.prev_complete_counter.get(sid, 0)
+            now = prev + 1 if signal else 0
+            self.prev_complete_counter[sid] = now
+            counters.append(now)
+            completed.append(now >= patience)
+
+        stale_ids = [k for k in self.prev_complete_counter.keys() if k not in alive_ids]
+        for sid in stale_ids:
+            self.prev_complete_counter.pop(sid, None)
+
+        return completed, counters
+
+    def _select_anchor_niches(self, rows: List[Dict], max_anchor_niches: int) -> List[int]:
+        candidates = [
+            i
+            for i, row in enumerate(rows)
+            if row["status"] in ("refining", "completed") and not row.get("is_overlap_redundant", False)
+        ]
+        if not candidates:
+            return []
+
+        ranked = sorted(
+            candidates,
+            key=lambda i: (
+                rows[i]["best_fit"],
+                -rows[i]["niche_age"],
+                rows[i]["radius_rel"],
+                -rows[i]["best_improve_rel"],
+            ),
+        )
+        return ranked[: max(1, max_anchor_niches)]
+
+    def _build_scout_release_pool(self, rows: List[Dict], per_niche_guardians: List[torch.Tensor]) -> List[int]:
+        pool: List[int] = []
+        for i, row in enumerate(rows):
+            members: torch.Tensor = row["members"]
+            guardian_ids: torch.Tensor = per_niche_guardians[i]
+            is_guardian = torch.zeros((members.shape[0],), dtype=torch.bool, device=members.device)
+            if guardian_ids.numel() > 0:
+                is_guardian = (members.unsqueeze(1) == guardian_ids.unsqueeze(0)).any(dim=1)
+
+            non_guard = members[~is_guardian]
+            if row["status"] == "completed":
+                pool.extend([int(x.item()) for x in non_guard])
+                continue
+            if row.get("is_overlap_redundant", False):
+                pool.extend([int(x.item()) for x in non_guard])
+                continue
+            if row["status"] == "exploring" and row["stag_ratio"] > 0.6 and row["stag_growth"] > self.release_exploring_stag:
+                pool.extend([int(x.item()) for x in non_guard])
+
+        seen = set()
+        ordered = []
+        for idx in pool:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            ordered.append(idx)
+        return ordered
+
+    def plan(
+        self,
+        pop: torch.Tensor,
+        fit: torch.Tensor,
+        stage_start_pop: torch.Tensor,
+        stage_start_fit: torch.Tensor,
+        stage_start_stagnation: torch.Tensor,
+        stagnation: torch.Tensor,
+        intent_eff: torch.Tensor,
+        initial_div: float,
+    ) -> NichePlan:
+        n = pop.shape[0]
+        device = pop.device
+        current_div = torch.std(pop, dim=0).mean().item()
+        eps = max(1e-6, 0.5 * current_div + 0.5 * float(initial_div) * (0.08 + 0.20 * float(intent_eff[2].item())))
+
+        _, clusters = self._cluster(pop, fit, eps=eps)
+
+        exploring = torch.zeros(n, dtype=torch.bool, device=device)
+        refining = torch.zeros(n, dtype=torch.bool, device=device)
+        completed = torch.zeros(n, dtype=torch.bool, device=device)
+        anchor = torch.zeros(n, dtype=torch.bool, device=device)
+        scout = torch.zeros(n, dtype=torch.bool, device=device)
+        guardian = torch.zeros(n, dtype=torch.bool, device=device)
+        release = torch.zeros(n, dtype=torch.bool, device=device)
+        rescue = torch.zeros(n, dtype=torch.bool, device=device)
+        overlap_group_ids = torch.full((n,), -1, dtype=torch.long, device=device)
+        redundant_particles = torch.zeros(n, dtype=torch.bool, device=device)
+
+        centers: List[torch.Tensor] = []
+        active_centers: List[torch.Tensor] = []
+        completed_centers: List[torch.Tensor] = []
+        anchor_centers: List[torch.Tensor] = []
+        rescue_pool: List[int] = []
+
+        niche_tmp: List[Dict] = []
+        complete_signal: List[bool] = []
+
+        anchor_guard_ratio = 0.05 + 0.20 * float(intent_eff[5].item())
+        completed_guard_ratio = min(0.10, 0.03 + 0.08 * float(intent_eff[5].item()))
+        for local_cid, members in enumerate(clusters):
+            m = members
+            c_pop = pop[m]
+            c_fit = fit[m]
+            c_pop_start = stage_start_pop[m]
+            c_fit_start = stage_start_fit[m]
+            c_stag = stagnation[m]
+            c_stag_start = stage_start_stagnation[m]
+
+            center = torch.mean(c_pop, dim=0)
+            centers.append(center)
+
+            center_start = torch.mean(c_pop_start, dim=0)
+            radius = torch.norm(c_pop - center.unsqueeze(0), dim=1).mean()
+            radius_start = torch.norm(c_pop_start - center_start.unsqueeze(0), dim=1).mean()
+            radius_rel = (radius / (initial_div + 1e-8)).item()
+            radius_shrink = ((radius_start - radius) / (radius_start + 1e-8)).item()
+
+            curr_best = torch.min(c_fit)
+            start_best = torch.min(c_fit_start)
+            best_improve_rel = ((start_best - curr_best) / (torch.abs(start_best) + 1e-8)).item()
+            improve_ratio_stage = torch.mean((c_fit < c_fit_start).float()).item()
+            stag_ratio = torch.mean((c_stag >= 10).float()).item()
+            stag_growth = torch.mean((c_stag - c_stag_start).float()).item()
+
+            local_complete_signal = (
+                radius_rel < self.r_small
+                and radius_shrink > self.r_shrink
+                and best_improve_rel < self.improve_eps
+                and improve_ratio_stage < self.improve_ratio_eps
+            )
+            complete_signal.append(local_complete_signal)
+
+            niche_tmp.append(
+                {
+                    "local_cluster_id": local_cid,
+                    "members": m,
+                    "size": int(len(m)),
+                    "center": center,
+                    "center_norm": float(torch.norm(center).item()),
+                    "radius": float(radius.item()),
+                    "radius_rel": float(radius_rel),
+                    "radius_shrink": float(radius_shrink),
+                    "best_fit": float(curr_best.item()),
+                    "best_improve_rel": float(best_improve_rel),
+                    "accept_ratio_stage": float(improve_ratio_stage),
+                    "improve_ratio_stage": float(improve_ratio_stage),
+                    "stag_ratio": float(stag_ratio),
+                    "stag_growth": float(stag_growth),
+                }
+            )
+
+        stable_ids, stable_ages, n_new_niches = self._assign_stable_ids(centers, eps=eps)
+        completed_flags, completion_counters = self._update_completion_counter(
+            stable_ids=stable_ids,
+            complete_signal=complete_signal,
+            patience=self.complete_patience,
+        )
+
+        if len(centers) > 0:
+            centers_t = torch.stack(centers, dim=0)
+            best_fit_t = torch.tensor([row["best_fit"] for row in niche_tmp], device=device)
+            group_ids = self._detect_overlap_groups(
+                centers=centers_t,
+                best_fit=best_fit_t,
+                merge_dist=self.merge_dist,
+                merge_fit_eps=self.merge_fit_eps,
+            )
+        else:
+            centers_t = torch.empty((0, self.dim), device=device)
+            group_ids = torch.empty((0,), dtype=torch.long, device=device)
+
+        keep_idx_by_gid: Dict[int, int] = {}
+        for i, row in enumerate(niche_tmp):
+            gid = int(group_ids[i].item()) if group_ids.numel() > 0 else -1
+            if gid not in keep_idx_by_gid or row["best_fit"] < niche_tmp[keep_idx_by_gid[gid]]["best_fit"]:
+                keep_idx_by_gid[gid] = i
+
+        for i, row in enumerate(niche_tmp):
+            row["niche_id"] = int(stable_ids[i])
+            row["niche_age"] = int(stable_ages[i])
+            row["completion_counter"] = int(completion_counters[i])
+            row["is_completed_signal"] = bool(complete_signal[i])
+            row["is_completed"] = bool(completed_flags[i])
+            row["overlap_group_id"] = int(group_ids[i].item()) if group_ids.numel() > 0 else -1
+            row["is_overlap_redundant"] = keep_idx_by_gid.get(row["overlap_group_id"], i) != i
+
+        for row in niche_tmp:
+            m = row["members"]
+            if row["is_completed"]:
+                status = "completed"
+            else:
+                is_refining = row["radius_rel"] < 0.05 and row["radius_shrink"] > 0.20 and row["best_improve_rel"] < 2e-3
+                status = "refining" if is_refining else "exploring"
+            row["status"] = status
+
+            if status == "completed":
+                completed[m] = True
+                completed_centers.append(row["center"])
+            elif status == "refining":
+                refining[m] = True
+                active_centers.append(row["center"])
+            else:
+                exploring[m] = True
+                active_centers.append(row["center"])
+                if not row["is_overlap_redundant"]:
+                    c_stag = stagnation[m]
+                    c_stag_start = stage_start_stagnation[m]
+                    score = (c_stag - c_stag_start).float() + 0.5 * (c_stag >= 10).float()
+                    local_bad = m[torch.argsort(score, descending=True)]
+                    topk = max(1, int(len(m) * min(0.4, 0.2 + 0.2 * float(intent_eff[4].item()))))
+                    for idx in local_bad[:topk]:
+                        rescue_pool.append(int(idx.item()))
+
+        per_niche_guardians: List[torch.Tensor] = [torch.empty((0,), dtype=torch.long, device=device) for _ in niche_tmp]
+        for i, row in enumerate(niche_tmp):
+            if row["status"] != "completed":
+                continue
+            m = row["members"]
+            c_fit = fit[m]
+            k = min(self.completed_guardian_cap, max(1, int(len(m) * completed_guard_ratio)))
+            local_order = torch.argsort(c_fit)
+            g_idx = m[local_order[:k]]
+            per_niche_guardians[i] = g_idx
+            guardian[g_idx] = True
+
+        anchor_local_ids = self._select_anchor_niches(niche_tmp, self.max_anchor_niches)
+        for i in anchor_local_ids:
+            row = niche_tmp[i]
+            m = row["members"]
+            anchor[m] = True
+            c_fit = fit[m]
+            k_anchor = max(1, int(len(m) * anchor_guard_ratio))
+            local_order = torch.argsort(c_fit)
+            anchor_guard = m[local_order[:k_anchor]]
+            if per_niche_guardians[i].numel() > 0:
+                per_niche_guardians[i] = torch.unique(torch.cat([per_niche_guardians[i], anchor_guard], dim=0))
+            else:
+                per_niche_guardians[i] = anchor_guard
+            guardian[per_niche_guardians[i]] = True
+            anchor_centers.append(row["center"])
+            if row["status"] == "exploring":
+                exploring[m] = False
+                refining[m] = True
+                row["status"] = "refining"
+
+        scout_pool = self._build_scout_release_pool(niche_tmp, per_niche_guardians)
+
+        cluster_ids = torch.full((n,), -1, dtype=torch.long, device=device)
+        for t, row in enumerate(niche_tmp):
+            cluster_ids[row["members"]] = stable_ids[t]
+            overlap_group_ids[row["members"]] = row["overlap_group_id"]
+            if row["is_overlap_redundant"]:
+                redundant_particles[row["members"]] = True
+
+        release_budget = int(self.pop_size * float(intent_eff[3].item()) * (0.30 + 0.70 * float(intent_eff[0].item())))
+        rescue_budget = int(self.pop_size * float(intent_eff[4].item()))
+
+        if release_budget > 0 and len(scout_pool) > 0:
+            release_sel = scout_pool[: min(release_budget, len(scout_pool))]
+            release[torch.tensor(release_sel, dtype=torch.long, device=device)] = True
+        if rescue_budget > 0 and len(rescue_pool) > 0:
+            rescue_sel = rescue_pool[: min(rescue_budget, len(rescue_pool))]
+            rescue[torch.tensor(rescue_sel, dtype=torch.long, device=device)] = True
+
+        rescue = rescue & (~guardian) & exploring & (~anchor) & (~completed)
+        release = release & (~guardian) & (~anchor)
+        scout = (exploring & (~anchor) & (~guardian) & (~completed))
+        scout = scout | (redundant_particles & (~anchor) & (~guardian) & (~completed))
+        scout = scout | release
+
+        completed_for_archive: List[torch.Tensor] = []
+        completed_fit_for_archive: List[float] = []
+        completed_age_for_archive: List[int] = []
+        for row in niche_tmp:
+            if row["status"] == "completed" and not row["is_overlap_redundant"]:
+                completed_for_archive.append(row["center"])
+                completed_fit_for_archive.append(float(row["best_fit"]))
+                completed_age_for_archive.append(int(row["niche_age"]))
+
+        archive_added = self._update_archive(
+            completed_for_archive,
+            completed_fit_for_archive,
+            completed_age_for_archive,
+            min_dist=max(1e-6, 1.5 * eps),
+        )
+
+        all_active_centers = active_centers + anchor_centers
+        if len(all_active_centers) == 0:
+            active_centers_t = torch.empty((0, self.dim), device=device)
+        else:
+            active_centers_t = torch.stack(all_active_centers, dim=0)
+        anchor_centers_t = torch.stack(anchor_centers, dim=0) if len(anchor_centers) > 0 else torch.empty((0, self.dim), device=device)
+        completed_centers_t = torch.stack(completed_centers, dim=0) if len(completed_centers) > 0 else torch.empty((0, self.dim), device=device)
+
+        niche_rows: List[Dict] = []
+        for row in niche_tmp:
+            m = row["members"]
+            center = row["center"]
+            if self.archive_centers.numel() == 0:
+                dist_archive_min = float("inf")
+            else:
+                dist_archive_min = float(torch.min(torch.norm(self.archive_centers - center.unsqueeze(0), dim=1)).item())
+
+            release_count = int(release[m].sum().item())
+            rescue_count = int(rescue[m].sum().item())
+            guardian_count = int(guardian[m].sum().item())
+
+            role = row["status"]
+            if anchor[m].any().item():
+                role = "anchor"
+            elif row.get("is_overlap_redundant", False):
+                role = "overlap_redundant"
+            elif scout[m].any().item():
+                role = "scout"
+
+            niche_rows.append(
+                {
+                    "niche_id": int(row["niche_id"]),
+                    "niche_age": int(row["niche_age"]),
+                    "size": int(row["size"]),
+                    "status": row["status"],
+                    "role": role,
+                    "center_norm": row["center_norm"],
+                    "radius": row["radius"],
+                    "radius_rel": row["radius_rel"],
+                    "radius_shrink": row["radius_shrink"],
+                    "best_fit": row["best_fit"],
+                    "best_improve_rel": row["best_improve_rel"],
+                    "accept_ratio_stage": row["accept_ratio_stage"],
+                    "improve_ratio_stage": row["improve_ratio_stage"],
+                    "stag_ratio": row["stag_ratio"],
+                    "stag_growth": row["stag_growth"],
+                    "guardian_count": guardian_count,
+                    "release_count": release_count,
+                    "rescue_count": rescue_count,
+                    "dist_to_archive_min": dist_archive_min,
+                    "overlap_group_id": int(row["overlap_group_id"]),
+                    "is_overlap_redundant": bool(row["is_overlap_redundant"]),
+                    "completion_counter": int(row["completion_counter"]),
+                    "is_anchor": bool(anchor[m].any().item()),
+                    "is_guardian": bool(guardian[m].any().item()),
+                }
+            )
+            self.prev_status_by_id[int(row["niche_id"])] = row["status"]
+
+        alive_ids = {int(row["niche_id"]) for row in niche_tmp}
+        stale_status_ids = [k for k in self.prev_status_by_id.keys() if k not in alive_ids]
+        for sid in stale_status_ids:
+            self.prev_status_by_id.pop(sid, None)
+
+        return NichePlan(
+            exploring_mask=exploring,
+            refining_mask=refining,
+            completed_mask=completed,
+            anchor_mask=anchor,
+            scout_mask=scout,
+            guardian_mask=guardian,
+            release_mask=release,
+            rescue_mask=rescue,
+            cluster_ids=cluster_ids,
+            overlap_group_ids=overlap_group_ids,
+            active_centers=active_centers_t,
+            anchor_centers=anchor_centers_t,
+            completed_centers=completed_centers_t,
+            niche_rows=niche_rows,
+            n_new_niches=n_new_niches,
+            archive_added=archive_added,
+        )
+
+    def sample_release_positions(
+        self,
+        n: int,
+        lb: torch.Tensor,
+        ub: torch.Tensor,
+        avoid_centers: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if n <= 0:
+            return torch.empty((0, self.dim), device=self.device)
+
+        avoid = self.archive_centers
+        if avoid_centers is not None and avoid_centers.numel() > 0:
+            if avoid.numel() == 0:
+                avoid = avoid_centers
+            else:
+                avoid = torch.cat([avoid, avoid_centers], dim=0)
+
+        if avoid.numel() == 0:
+            return lb + torch.rand((n, self.dim), device=self.device) * (ub - lb)
+
+        low = lb
+        high = ub
+        span = torch.norm((ub - lb).squeeze(0)).item()
+        min_dist = max(1e-6, 0.10 * span / (self.dim ** 0.5))
+
+        out = []
+        needed = n
+        attempts = 0
+        while needed > 0 and attempts < 20:
+            cand = low + torch.rand((max(needed * 2, 8), self.dim), device=self.device) * (high - low)
+            d = torch.cdist(cand, avoid)
+            keep = torch.min(d, dim=1).values > min_dist
+            kept = cand[keep]
+            take = min(needed, kept.shape[0])
+            if take > 0:
+                out.append(kept[:take])
+                needed -= take
+            attempts += 1
+
+        if needed > 0:
+            out.append(low + torch.rand((needed, self.dim), device=self.device) * (high - low))
+        return torch.cat(out, dim=0)
+
+
+==================================================
+
+// [MODULE] File: rlec\features\__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec\features\macro_state.py
+----------------------------------------
+import torch
+from rlec.utils.population_metrics import (
+    compute_diversity,
+    compute_fitness_skewness,
+    compute_rank_entropy,
+    compute_stagnation_ratio,
+    compute_elite_separation,
+)
+
+
+class MacroStateBuilder:
+    def __init__(self, dim: int, pop_size: int):
+        self.dim = dim
+        self.pop_size = pop_size
+        self.state_dim = 30  # 8 base + 6 action + 4 feedback + 12 niche summary
+
+    def build(
+        self,
+        pop_t: torch.Tensor,
+        fit_t: torch.Tensor,
+        pop_t_minus_k: torch.Tensor,
+        fit_t_minus_k: torch.Tensor,
+        stagnation: torch.Tensor,
+        last_action: torch.Tensor,
+        feedback_stats: torch.Tensor,
+        niche_summary: torch.Tensor,
+    ) -> torch.Tensor:
+        best_t, best_t_k = torch.min(fit_t), torch.min(fit_t_minus_k)
+        median_t, median_t_k = torch.median(fit_t), torch.median(fit_t_minus_k)
+        prog_best = (best_t_k - best_t) / (torch.abs(best_t_k) + 1e-8)
+        prog_median = (median_t_k - median_t) / (torch.abs(median_t_k) + 1e-8)
+
+        div_t = compute_diversity(pop_t)
+        div_t_k = compute_diversity(pop_t_minus_k)
+        div_change = (div_t - div_t_k) / (div_t_k + 1e-8)
+        stag_ratio = compute_stagnation_ratio(stagnation, threshold=10)
+        separation = compute_elite_separation(pop_t, fit_t)
+        skewness = compute_fitness_skewness(fit_t)
+        entropy = compute_rank_entropy(fit_t)
+
+        state = torch.cat(
+            [
+                torch.clamp(prog_best.unsqueeze(0), -5.0, 5.0),
+                torch.clamp(prog_median.unsqueeze(0), -5.0, 5.0),
+                torch.clamp(div_t.unsqueeze(0) / 100.0, 0.0, 5.0),
+                torch.clamp(div_change.unsqueeze(0), -1.0, 1.0),
+                stag_ratio.unsqueeze(0),
+                skewness.unsqueeze(0) / 5.0,
+                entropy.unsqueeze(0),
+                torch.clamp(separation.unsqueeze(0) / 10.0, 0.0, 5.0),
+                torch.clamp(last_action.flatten(), 0.0, 1.0),
+                feedback_stats,
+                niche_summary,
+            ],
+            dim=0,
+        )
+        return state.unsqueeze(0)
+
+
+==================================================
+
+// [MODULE] File: rlec\features\stage_reward.py
+----------------------------------------
+import torch
+
+
+class StageRewardCalculator:
+    def __init__(self):
+        pass
+
+    def calculate(
+        self,
+        fit_start: torch.Tensor,
+        fit_end: torch.Tensor,
+        div_start: float,
+        div_end: float,
+        target_div: float,
+        initial_div: float,
+        stagnation_start: torch.Tensor,
+        stag_ratio_start: float,
+        stag_ratio_end: float,
+        action: torch.Tensor,
+        feedbacks: torch.Tensor,
+        niche_stats: torch.Tensor,
+    ) -> float:
+        intervene_ratio, accept_ratio, rescue_success, elite_damage = feedbacks
+
+        best_start, best_end = torch.min(fit_start), torch.min(fit_end)
+        median_start, median_end = torch.median(fit_start), torch.median(fit_end)
+        q20_start = torch.quantile(fit_start, 0.2)
+        q20_end = torch.quantile(fit_end, 0.2)
+
+        r_best = torch.log1p(torch.relu(best_start - best_end)) / (torch.log1p(torch.abs(best_start)) + 1e-8)
+        r_median = torch.log1p(torch.relu(median_start - median_end)) / (torch.log1p(torch.abs(median_start)) + 1e-8)
+        r_q20 = torch.log1p(torch.relu(q20_start - q20_end)) / (torch.log1p(torch.abs(q20_start)) + 1e-8)
+        r_perf = 2.0 * r_best.item() + 0.5 * r_median.item() + 1.0 * r_q20.item()
+
+        best_end_safe = torch.clamp(best_end, min=0.0)
+        r_precision = 0.02 * (-torch.log(best_end_safe + 1e-12)).item()
+        r_precision = min(r_precision, 0.8)
+
+        r_efficiency = accept_ratio.item() - 0.5 * intervene_ratio.item()
+        r_rescue = rescue_success.item()
+        r_elite_stab = -1.0 * elite_damage.item()
+        div_error = abs(div_end - target_div) / (initial_div + 1e-8)
+        r_div_overshoot = -0.5 * div_error
+        r_stag = stag_ratio_start - stag_ratio_end
+
+        action = torch.clamp(action, 0.0, 1.0)
+        e_t, x_t, _, b_t, _, _ = action.tolist()
+        r_balance = -0.02 * abs(e_t - x_t)
+        r_budget_safety = -0.05 * max(0.0, b_t - 0.8)
+        compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
+        r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
+
+        # niche_stats = [
+        #   new_niche_norm, archive_unique_norm, repeat_ratio,
+        #   guardian_stability, release_efficiency,
+        #   anchor_stability, scout_birth_efficiency, overlap_penalty
+        # ]
+        (
+            new_niche_norm,
+            archive_unique_norm,
+            repeat_ratio,
+            guardian_stability,
+            release_efficiency,
+            anchor_stability,
+            scout_birth_efficiency,
+            overlap_penalty,
+        ) = niche_stats.tolist()
+
+        r_new_niche = 0.20 * new_niche_norm
+        r_archive_unique = 0.20 * archive_unique_norm
+        r_repeat_penalty = -0.25 * repeat_ratio
+        r_guardian_stability = 0.20 * guardian_stability
+        r_release_eff = 0.20 * release_efficiency
+
+        # Incremental new terms with small weights.
+        r_anchor_stability = 0.12 * anchor_stability
+        r_scout_birth = 0.12 * scout_birth_efficiency
+        r_overlap_penalty = -0.10 * overlap_penalty
+
+        r_niche = (
+            r_new_niche
+            + r_archive_unique
+            + r_repeat_penalty
+            + r_guardian_stability
+            + r_release_eff
+            + r_anchor_stability
+            + r_scout_birth
+            + r_overlap_penalty
+        )
+
+        r_ctrl = (
+            r_efficiency
+            + r_rescue
+            + r_elite_stab
+            + r_div_overshoot
+            + r_stag
+            + r_balance
+            + r_budget_safety
+            + r_late_settle
+        )
+
+        total_reward = r_perf + r_ctrl + r_precision + r_niche
+        return total_reward
+
+
+==================================================
+
+// [MODULE] File: rlec\rl\__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec\rl\networks.py
+----------------------------------------
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
+
+
+class ActorMLP(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 32):  # 降至 32
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim)  # 去掉第二层隐藏层，加速拟合
+        )
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+    def forward(self, state):
+        mean = self.net(state)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+class CriticMLP(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state):
+        return self.net(state)
+
+==================================================
+
+// [MODULE] File: rlec\rl\ppo.py
+----------------------------------------
+import torch
+import torch.nn as nn
+import numpy as np
+from .networks import ActorMLP, CriticMLP
+from .rollout_buffer import RolloutBuffer
+
+
+class PPO:
+    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
+                 lr_actor=3e-4, lr_critic=1e-3, gamma=0.99, clip_ratio=0.15,
+                 entropy_coef=0.002, k_epochs=2):
+        self.device = device
+        self.gamma = gamma
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.k_epochs = k_epochs
+
+        self.actor = ActorMLP(state_dim, action_dim).to(device)
+        self.critic = CriticMLP(state_dim).to(device)
+
+        self.optimizer = torch.optim.Adam([
+            {'params': self.actor.parameters(), 'lr': lr_actor},
+            {'params': self.critic.parameters(), 'lr': lr_critic}
+        ])
+        self.buffer = RolloutBuffer(device)
+
+    def select_action(self, state: torch.Tensor, deterministic=False):
+        with torch.no_grad():
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+
+            dist = self.actor(state)
+            value = self.critic(state)
+            action_delta = dist.mean if deterministic else dist.sample()
+            log_prob = dist.log_prob(action_delta).sum(dim=-1)
+
+            # 动作平滑与安全先验 (Safe Prior)
+            # a_safe: [e=0.3, x=0.5, d=0.5, b=0.2, r=0.1, p=0.8] 提供稳健初始形态
+            a_safe = torch.tensor([0.3, 0.5, 0.5, 0.2, 0.1, 0.8], device=self.device)
+            epsilon = 0.2  # 最大允许网络偏离安全值的范围
+
+            # 使用 tanh 把网络输出压到 [-1, 1]，然后映射到微调区间
+            delta_scaled = torch.tanh(action_delta) * epsilon
+            intent_action = torch.clamp(a_safe + delta_scaled, 0.0, 1.0)
+
+        return (
+            action_delta.squeeze(0).cpu().numpy(),
+            intent_action.squeeze(0).cpu().numpy(),
+            log_prob.squeeze(0).item(),
+            value.squeeze(0).item()
+        )
+
+    def update(self):
+        if len(self.buffer.states) == 0: return {}
+
+        states = torch.stack(self.buffer.states).to(self.device)
+        actions = torch.stack(self.buffer.actions).to(self.device)
+        old_log_probs = torch.tensor(self.buffer.log_probs, device=self.device)
+
+        with torch.no_grad():
+            next_value = self.critic(states[-1:]).item()
+
+        returns, advantages = self.buffer.compute_gae(next_value, self.gamma)
+        actor_loss_list, critic_loss_list = [], []
+
+        for _ in range(self.k_epochs):
+            dist = self.actor(states)
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1).mean()
+
+            ratios = torch.exp(log_probs - old_log_probs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
+
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+            values = self.critic(states).reshape(-1)
+            returns = returns.reshape(-1)
+            critic_loss = nn.MSELoss()(values, returns)
+
+            loss = actor_loss + 0.5 * critic_loss
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            self.optimizer.step()
+
+            actor_loss_list.append(actor_loss.item())
+            critic_loss_list.append(critic_loss.item())
+
+        self.buffer.clear()
+        return {"actor_loss": np.mean(actor_loss_list), "critic_loss": np.mean(critic_loss_list)}
+
+==================================================
+
+// [MODULE] File: rlec\rl\rollout_buffer.py
+----------------------------------------
+import torch
+
+class RolloutBuffer:
+    """PPO 专用的 On-policy 轨迹缓冲池"""
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.clear()
+
+    def clear(self):
+        self.states, self.actions, self.rewards = [], [], []
+        self.values, self.log_probs, self.dones = [], [], []
+
+    def add(self, state, action, reward, value, log_prob, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.log_probs.append(log_prob)
+        self.dones.append(done)
+
+    def compute_gae(self, next_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        values = torch.tensor(self.values + [next_value], dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+
+        advantages = torch.zeros(len(rewards), dtype=torch.float32, device=self.device)
+        last_gae = 0.0
+
+        for t in reversed(range(len(rewards))):
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
+            advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
+
+        returns = advantages + values[:-1]
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return returns, advantages
+
+==================================================
+
+// [MODULE] File: rlec\utils\__init__.py
+----------------------------------------
+
+
+==================================================
+
+// [MODULE] File: rlec\utils\niche_logger.py
+----------------------------------------
+from __future__ import annotations
+
+import csv
+import os
+from typing import Dict, List
+
+
+class NicheLogger:
+    def __init__(self, output_dir: str | None):
+        self.output_dir = output_dir
+        self.stage_rows: List[Dict] = []
+        self.niche_rows: List[Dict] = []
+
+    def log_stage(self, row: dict) -> None:
+        self.stage_rows.append(row)
+
+    def log_niches(self, rows: list[dict]) -> None:
+        if rows:
+            self.niche_rows.extend(rows)
+
+    def flush(self, stage_csv_path: str, niche_csv_path: str) -> None:
+        if self.output_dir is None:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._write_csv(stage_csv_path, self.stage_rows)
+        self._write_csv(niche_csv_path, self.niche_rows)
+
+    @staticmethod
+    def _write_csv(path: str, rows: List[Dict]) -> None:
+        if len(rows) == 0:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("")
+            return
+        fieldnames = list(rows[0].keys())
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+
+==================================================
+
+// [MODULE] File: rlec\utils\population_metrics.py
+----------------------------------------
+import torch
+
+
+def compute_diversity(pop: torch.Tensor) -> torch.Tensor:
+    return torch.std(pop, dim=0).mean()
+
+
+def compute_fitness_skewness(fit: torch.Tensor) -> torch.Tensor:
+    mean = fit.mean()
+    std = fit.std() + 1e-8
+    skewness = torch.mean(((fit - mean) / std) ** 3)
+    return torch.clamp(skewness, -5.0, 5.0)
+
+
+def compute_rank_entropy(fit: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    norm_fit = (fit - fit.mean()) / (fit.std() + 1e-8)
+    probs = torch.softmax(-norm_fit / temperature, dim=0)
+    entropy = -(probs * torch.log(probs + 1e-8)).sum()
+    max_entropy = torch.log(torch.tensor(float(fit.shape[0]), device=fit.device))
+    return entropy / max_entropy
+
+
+def compute_stagnation_ratio(stagnation: torch.Tensor, threshold: int = 10) -> torch.Tensor:
+    stagnant_count = (stagnation >= threshold).sum().float()
+    return stagnant_count / stagnation.shape[0]
+
+
+# 【必须改 4】：新增聚类分离度特征，识别种群是否塌缩为单峰
+def compute_elite_separation(pop: torch.Tensor, fit: torch.Tensor, q: float = 0.1) -> torch.Tensor:
+    """计算精英簇与其他个体之间的分离度 (分离度越高，说明盆地越多/结构越清晰)"""
+    N = pop.shape[0]
+    k = max(1, int(N * q))
+
+    _, indices = torch.sort(fit)
+    elite_idx = indices[:k]
+    non_elite_idx = indices[k:]
+
+    elite_pop = pop[elite_idx]
+    non_elite_pop = pop[non_elite_idx]
+
+    # 找到精英簇的中心点
+    elite_center = elite_pop.mean(dim=0)
+
+    # 精英簇内部的紧凑度
+    elite_spread = torch.norm(elite_pop - elite_center, dim=1).mean()
+    # 大众个体离精英中心的平均距离
+    separation = torch.norm(non_elite_pop - elite_center, dim=1).mean()
+
+    # 比例越大，说明种群不仅有精英，还有大量个体在远方探索 (多模态结构)
+    return separation / (elite_spread + 1e-8)
 
 ==================================================
 

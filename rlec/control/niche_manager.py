@@ -1,7 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -10,32 +10,69 @@ import torch
 class NichePlan:
     exploring_mask: torch.Tensor
     refining_mask: torch.Tensor
-    converged_mask: torch.Tensor
+    completed_mask: torch.Tensor
+    anchor_mask: torch.Tensor
+    scout_mask: torch.Tensor
     guardian_mask: torch.Tensor
     release_mask: torch.Tensor
     rescue_mask: torch.Tensor
     cluster_ids: torch.Tensor
+    overlap_group_ids: torch.Tensor
     active_centers: torch.Tensor
+    anchor_centers: torch.Tensor
+    completed_centers: torch.Tensor
     niche_rows: List[Dict]
     n_new_niches: int
     archive_added: int
 
 
 class NicheManager:
-    """Niche-level lifecycle planner with stable niche IDs and archive."""
+    """Niche-level lifecycle planner with stable IDs, completion patience, overlap merge, and scout release."""
 
-    def __init__(self, pop_size: int, dim: int, device: torch.device):
+    def __init__(
+        self,
+        pop_size: int,
+        dim: int,
+        device: torch.device,
+        r_small: float = 0.01,
+        r_shrink: float = 0.40,
+        improve_eps: float = 5e-4,
+        improve_ratio_eps: float = 0.20,
+        complete_patience: int = 2,
+        merge_dist: float = 1.2,
+        merge_fit_eps: float = 1e-2,
+        max_anchor_niches: int = 2,
+        anchor_scale: float = 0.20,
+        release_exploring_stag: float = 16.0,
+        completed_guardian_cap: int = 2,
+    ):
         self.pop_size = pop_size
         self.dim = dim
         self.device = device
+        self.r_small = r_small
+        self.r_shrink = r_shrink
+        self.improve_eps = improve_eps
+        self.improve_ratio_eps = improve_ratio_eps
+        self.complete_patience = complete_patience
+        self.merge_dist = merge_dist
+        self.merge_fit_eps = merge_fit_eps
+        self.max_anchor_niches = max_anchor_niches
+        self.anchor_scale = anchor_scale
+        self.release_exploring_stag = release_exploring_stag
+        self.completed_guardian_cap = completed_guardian_cap
+
         self.archive_centers = torch.empty((0, dim), device=device)
+        self.archive_best_fit: List[float] = []
+        self.archive_age: List[int] = []
 
         self.prev_centers = torch.empty((0, dim), device=device)
         self.prev_ids: List[int] = []
         self.prev_ages: List[int] = []
+        self.prev_status_by_id: Dict[int, str] = {}
+        self.prev_complete_counter: Dict[int, int] = {}
         self.next_niche_id = 0
 
-    def _cluster(self, pop: torch.Tensor, fit: torch.Tensor, eps: float) -> tuple[torch.Tensor, List[torch.Tensor]]:
+    def _cluster(self, pop: torch.Tensor, fit: torch.Tensor, eps: float) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         n = pop.shape[0]
         cluster_ids = torch.full((n,), -1, dtype=torch.long, device=pop.device)
         order = torch.argsort(fit)  # best-first
@@ -54,20 +91,30 @@ class NicheManager:
             clusters.append(torch.where(cluster_ids == k)[0])
         return cluster_ids, clusters
 
-    def _update_archive(self, centers: List[torch.Tensor], min_dist: float) -> int:
+    def _update_archive(
+        self,
+        centers: List[torch.Tensor],
+        best_fits: List[float],
+        ages: List[int],
+        min_dist: float,
+    ) -> int:
         added = 0
-        for c in centers:
+        for idx, c in enumerate(centers):
             if self.archive_centers.numel() == 0:
                 self.archive_centers = c.unsqueeze(0)
+                self.archive_best_fit.append(float(best_fits[idx]))
+                self.archive_age.append(int(ages[idx]))
                 added += 1
                 continue
             d = torch.norm(self.archive_centers - c.unsqueeze(0), dim=1)
             if torch.min(d).item() > min_dist:
                 self.archive_centers = torch.cat([self.archive_centers, c.unsqueeze(0)], dim=0)
+                self.archive_best_fit.append(float(best_fits[idx]))
+                self.archive_age.append(int(ages[idx]))
                 added += 1
         return added
 
-    def _assign_stable_ids(self, centers: List[torch.Tensor], eps: float) -> tuple[List[int], List[int], int]:
+    def _assign_stable_ids(self, centers: List[torch.Tensor], eps: float) -> Tuple[List[int], List[int], int]:
         if len(centers) == 0:
             self.prev_centers = torch.empty((0, self.dim), device=self.device)
             self.prev_ids = []
@@ -94,7 +141,6 @@ class NicheManager:
         ages = [1] * len(centers)
         used_prev = set()
 
-        # Greedy nearest matching under threshold.
         flat = []
         for i in range(d.shape[0]):
             for j in range(d.shape[1]):
@@ -122,6 +168,123 @@ class NicheManager:
         self.prev_ages = ages
         return ids, ages, new_count
 
+    def _detect_overlap_groups(
+        self,
+        centers: torch.Tensor,
+        best_fit: torch.Tensor,
+        merge_dist: float,
+        merge_fit_eps: float,
+    ) -> torch.Tensor:
+        if centers.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+
+        n = centers.shape[0]
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        dist_mat = torch.cdist(centers, centers)
+        for i in range(n):
+            for j in range(i + 1, n):
+                cond_a = float(dist_mat[i, j].item()) < merge_dist
+                denom = max(abs(float(best_fit[i].item())), abs(float(best_fit[j].item())), 1e-8)
+                fit_rel = abs(float(best_fit[i].item()) - float(best_fit[j].item())) / denom
+                cond_b = fit_rel < merge_fit_eps
+                if cond_a and cond_b:
+                    union(i, j)
+
+        root_to_gid: Dict[int, int] = {}
+        next_gid = 0
+        group_ids = torch.full((n,), -1, dtype=torch.long, device=self.device)
+        for i in range(n):
+            r = find(i)
+            if r not in root_to_gid:
+                root_to_gid[r] = next_gid
+                next_gid += 1
+            group_ids[i] = root_to_gid[r]
+        return group_ids
+
+    def _update_completion_counter(
+        self,
+        stable_ids: List[int],
+        complete_signal: List[bool],
+        patience: int,
+    ) -> Tuple[List[bool], List[int]]:
+        completed: List[bool] = []
+        counters: List[int] = []
+        alive_ids = set(stable_ids)
+
+        for sid, signal in zip(stable_ids, complete_signal):
+            prev = self.prev_complete_counter.get(sid, 0)
+            now = prev + 1 if signal else 0
+            self.prev_complete_counter[sid] = now
+            counters.append(now)
+            completed.append(now >= patience)
+
+        stale_ids = [k for k in self.prev_complete_counter.keys() if k not in alive_ids]
+        for sid in stale_ids:
+            self.prev_complete_counter.pop(sid, None)
+
+        return completed, counters
+
+    def _select_anchor_niches(self, rows: List[Dict], max_anchor_niches: int) -> List[int]:
+        candidates = [
+            i
+            for i, row in enumerate(rows)
+            if row["status"] in ("refining", "completed") and not row.get("is_overlap_redundant", False)
+        ]
+        if not candidates:
+            return []
+
+        ranked = sorted(
+            candidates,
+            key=lambda i: (
+                rows[i]["best_fit"],
+                -rows[i]["niche_age"],
+                rows[i]["radius_rel"],
+                -rows[i]["best_improve_rel"],
+            ),
+        )
+        return ranked[: max(1, max_anchor_niches)]
+
+    def _build_scout_release_pool(self, rows: List[Dict], per_niche_guardians: List[torch.Tensor]) -> List[int]:
+        pool: List[int] = []
+        for i, row in enumerate(rows):
+            members: torch.Tensor = row["members"]
+            guardian_ids: torch.Tensor = per_niche_guardians[i]
+            is_guardian = torch.zeros((members.shape[0],), dtype=torch.bool, device=members.device)
+            if guardian_ids.numel() > 0:
+                is_guardian = (members.unsqueeze(1) == guardian_ids.unsqueeze(0)).any(dim=1)
+
+            non_guard = members[~is_guardian]
+            if row["status"] == "completed":
+                pool.extend([int(x.item()) for x in non_guard])
+                continue
+            if row.get("is_overlap_redundant", False):
+                pool.extend([int(x.item()) for x in non_guard])
+                continue
+            if row["status"] == "exploring" and row["stag_ratio"] > 0.6 and row["stag_growth"] > self.release_exploring_stag:
+                pool.extend([int(x.item()) for x in non_guard])
+
+        seen = set()
+        ordered = []
+        for idx in pool:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            ordered.append(idx)
+        return ordered
+
     def plan(
         self,
         pop: torch.Tensor,
@@ -138,25 +301,30 @@ class NicheManager:
         current_div = torch.std(pop, dim=0).mean().item()
         eps = max(1e-6, 0.5 * current_div + 0.5 * float(initial_div) * (0.08 + 0.20 * float(intent_eff[2].item())))
 
-        cluster_ids_local, clusters = self._cluster(pop, fit, eps=eps)
+        _, clusters = self._cluster(pop, fit, eps=eps)
 
         exploring = torch.zeros(n, dtype=torch.bool, device=device)
         refining = torch.zeros(n, dtype=torch.bool, device=device)
-        converged = torch.zeros(n, dtype=torch.bool, device=device)
+        completed = torch.zeros(n, dtype=torch.bool, device=device)
+        anchor = torch.zeros(n, dtype=torch.bool, device=device)
+        scout = torch.zeros(n, dtype=torch.bool, device=device)
         guardian = torch.zeros(n, dtype=torch.bool, device=device)
         release = torch.zeros(n, dtype=torch.bool, device=device)
         rescue = torch.zeros(n, dtype=torch.bool, device=device)
+        overlap_group_ids = torch.full((n,), -1, dtype=torch.long, device=device)
+        redundant_particles = torch.zeros(n, dtype=torch.bool, device=device)
 
         centers: List[torch.Tensor] = []
-        converged_centers: List[torch.Tensor] = []
         active_centers: List[torch.Tensor] = []
-        release_pool: List[int] = []
+        completed_centers: List[torch.Tensor] = []
+        anchor_centers: List[torch.Tensor] = []
         rescue_pool: List[int] = []
 
-        # Per-niche temporary metrics for logging.
         niche_tmp: List[Dict] = []
+        complete_signal: List[bool] = []
 
-        guard_ratio = 0.05 + 0.20 * float(intent_eff[5].item())
+        anchor_guard_ratio = 0.05 + 0.20 * float(intent_eff[5].item())
+        completed_guard_ratio = min(0.10, 0.03 + 0.08 * float(intent_eff[5].item()))
         for local_cid, members in enumerate(clusters):
             m = members
             c_pop = pop[m]
@@ -182,48 +350,19 @@ class NicheManager:
             stag_ratio = torch.mean((c_stag >= 10).float()).item()
             stag_growth = torch.mean((c_stag - c_stag_start).float()).item()
 
-            is_converged = (
-                radius_rel < 0.01
-                and radius_shrink > 0.40
-                and best_improve_rel < 5e-4
-                and improve_ratio_stage < 0.20
+            local_complete_signal = (
+                radius_rel < self.r_small
+                and radius_shrink > self.r_shrink
+                and best_improve_rel < self.improve_eps
+                and improve_ratio_stage < self.improve_ratio_eps
             )
-            is_refining = (not is_converged) and (
-                radius_rel < 0.05
-                and radius_shrink > 0.20
-                and best_improve_rel < 2e-3
-            )
-
-            if is_converged:
-                converged[m] = True
-                converged_centers.append(center)
-                k = max(1, int(len(m) * guard_ratio))
-                local_order = torch.argsort(c_fit)
-                g_idx = m[local_order[:k]]
-                guardian[g_idx] = True
-                for idx in m[local_order[k:]]:
-                    release_pool.append(int(idx.item()))
-                status = "converged"
-            elif is_refining:
-                refining[m] = True
-                active_centers.append(center)
-                status = "refining"
-            else:
-                exploring[m] = True
-                active_centers.append(center)
-                score = (c_stag - c_stag_start).float() + 0.5 * (c_stag >= 10).float()
-                local_bad = m[torch.argsort(score, descending=True)]
-                topk = max(1, int(len(m) * min(0.4, 0.2 + 0.2 * float(intent_eff[4].item()))))
-                for idx in local_bad[:topk]:
-                    rescue_pool.append(int(idx.item()))
-                status = "exploring"
+            complete_signal.append(local_complete_signal)
 
             niche_tmp.append(
                 {
                     "local_cluster_id": local_cid,
                     "members": m,
                     "size": int(len(m)),
-                    "status": status,
                     "center": center,
                     "center_norm": float(torch.norm(center).item()),
                     "radius": float(radius.item()),
@@ -239,35 +378,151 @@ class NicheManager:
             )
 
         stable_ids, stable_ages, n_new_niches = self._assign_stable_ids(centers, eps=eps)
+        completed_flags, completion_counters = self._update_completion_counter(
+            stable_ids=stable_ids,
+            complete_signal=complete_signal,
+            patience=self.complete_patience,
+        )
 
-        # Build stable per-particle cluster ids.
+        if len(centers) > 0:
+            centers_t = torch.stack(centers, dim=0)
+            best_fit_t = torch.tensor([row["best_fit"] for row in niche_tmp], device=device)
+            merge_dist_eff = max(1e-6, float(self.merge_dist) * float(eps))
+            group_ids = self._detect_overlap_groups(
+                centers=centers_t,
+                best_fit=best_fit_t,
+                merge_dist=merge_dist_eff,
+                merge_fit_eps=self.merge_fit_eps,
+            )
+        else:
+            centers_t = torch.empty((0, self.dim), device=device)
+            group_ids = torch.empty((0,), dtype=torch.long, device=device)
+
+        keep_idx_by_gid: Dict[int, int] = {}
+        for i, row in enumerate(niche_tmp):
+            gid = int(group_ids[i].item()) if group_ids.numel() > 0 else -1
+            if gid not in keep_idx_by_gid or row["best_fit"] < niche_tmp[keep_idx_by_gid[gid]]["best_fit"]:
+                keep_idx_by_gid[gid] = i
+
+        for i, row in enumerate(niche_tmp):
+            row["niche_id"] = int(stable_ids[i])
+            row["niche_age"] = int(stable_ages[i])
+            row["completion_counter"] = int(completion_counters[i])
+            row["is_completed_signal"] = bool(complete_signal[i])
+            row["is_completed"] = bool(completed_flags[i])
+            row["overlap_group_id"] = int(group_ids[i].item()) if group_ids.numel() > 0 else -1
+            row["is_overlap_redundant"] = keep_idx_by_gid.get(row["overlap_group_id"], i) != i
+
+        for row in niche_tmp:
+            m = row["members"]
+            if row["is_completed"]:
+                status = "completed"
+            else:
+                is_refining = row["radius_rel"] < 0.05 and row["radius_shrink"] > 0.20 and row["best_improve_rel"] < 2e-3
+                status = "refining" if is_refining else "exploring"
+            row["status"] = status
+
+            if status == "completed":
+                completed[m] = True
+                completed_centers.append(row["center"])
+            elif status == "refining":
+                refining[m] = True
+                active_centers.append(row["center"])
+            else:
+                exploring[m] = True
+                active_centers.append(row["center"])
+                if not row["is_overlap_redundant"]:
+                    c_stag = stagnation[m]
+                    c_stag_start = stage_start_stagnation[m]
+                    score = (c_stag - c_stag_start).float() + 0.5 * (c_stag >= 10).float()
+                    local_bad = m[torch.argsort(score, descending=True)]
+                    topk = max(1, int(len(m) * min(0.4, 0.2 + 0.2 * float(intent_eff[4].item()))))
+                    for idx in local_bad[:topk]:
+                        rescue_pool.append(int(idx.item()))
+
+        per_niche_guardians: List[torch.Tensor] = [torch.empty((0,), dtype=torch.long, device=device) for _ in niche_tmp]
+        for i, row in enumerate(niche_tmp):
+            if row["status"] != "completed":
+                continue
+            m = row["members"]
+            c_fit = fit[m]
+            k = min(self.completed_guardian_cap, max(1, int(len(m) * completed_guard_ratio)))
+            local_order = torch.argsort(c_fit)
+            g_idx = m[local_order[:k]]
+            per_niche_guardians[i] = g_idx
+            guardian[g_idx] = True
+
+        anchor_local_ids = self._select_anchor_niches(niche_tmp, self.max_anchor_niches)
+        for i in anchor_local_ids:
+            row = niche_tmp[i]
+            m = row["members"]
+            anchor[m] = True
+            c_fit = fit[m]
+            k_anchor = max(1, int(len(m) * anchor_guard_ratio))
+            local_order = torch.argsort(c_fit)
+            anchor_guard = m[local_order[:k_anchor]]
+            if per_niche_guardians[i].numel() > 0:
+                per_niche_guardians[i] = torch.unique(torch.cat([per_niche_guardians[i], anchor_guard], dim=0))
+            else:
+                per_niche_guardians[i] = anchor_guard
+            guardian[per_niche_guardians[i]] = True
+            anchor_centers.append(row["center"])
+            if row["status"] == "exploring":
+                exploring[m] = False
+                refining[m] = True
+                row["status"] = "refining"
+
+        scout_pool = self._build_scout_release_pool(niche_tmp, per_niche_guardians)
+
         cluster_ids = torch.full((n,), -1, dtype=torch.long, device=device)
         for t, row in enumerate(niche_tmp):
             cluster_ids[row["members"]] = stable_ids[t]
+            overlap_group_ids[row["members"]] = row["overlap_group_id"]
+            if row["is_overlap_redundant"]:
+                redundant_particles[row["members"]] = True
 
-        # Budgeted release and rescue.
         release_budget = int(self.pop_size * float(intent_eff[3].item()) * (0.30 + 0.70 * float(intent_eff[0].item())))
         rescue_budget = int(self.pop_size * float(intent_eff[4].item()))
 
-        if release_budget > 0 and len(release_pool) > 0:
-            release_sel = release_pool[: min(release_budget, len(release_pool))]
+        if release_budget > 0 and len(scout_pool) > 0:
+            release_sel = scout_pool[: min(release_budget, len(scout_pool))]
             release[torch.tensor(release_sel, dtype=torch.long, device=device)] = True
         if rescue_budget > 0 and len(rescue_pool) > 0:
             rescue_sel = rescue_pool[: min(rescue_budget, len(rescue_pool))]
             rescue[torch.tensor(rescue_sel, dtype=torch.long, device=device)] = True
 
-        rescue = rescue & (~guardian)
-        release = release & (~guardian)
+        rescue = rescue & (~guardian) & exploring & (~anchor) & (~completed)
+        release = release & (~guardian) & (~anchor)
+        scout = (exploring & (~anchor) & (~guardian) & (~completed))
+        scout = scout | (redundant_particles & (~anchor) & (~guardian) & (~completed))
+        scout = scout | release
 
-        archive_added = self._update_archive(converged_centers, min_dist=max(1e-6, 1.5 * eps))
+        completed_for_archive: List[torch.Tensor] = []
+        completed_fit_for_archive: List[float] = []
+        completed_age_for_archive: List[int] = []
+        for row in niche_tmp:
+            if row["status"] == "completed" and not row["is_overlap_redundant"]:
+                completed_for_archive.append(row["center"])
+                completed_fit_for_archive.append(float(row["best_fit"]))
+                completed_age_for_archive.append(int(row["niche_age"]))
 
-        if len(active_centers) == 0:
+        archive_added = self._update_archive(
+            completed_for_archive,
+            completed_fit_for_archive,
+            completed_age_for_archive,
+            min_dist=max(1e-6, 1.5 * eps),
+        )
+
+        all_active_centers = active_centers + anchor_centers
+        if len(all_active_centers) == 0:
             active_centers_t = torch.empty((0, self.dim), device=device)
         else:
-            active_centers_t = torch.stack(active_centers, dim=0)
+            active_centers_t = torch.stack(all_active_centers, dim=0)
+        anchor_centers_t = torch.stack(anchor_centers, dim=0) if len(anchor_centers) > 0 else torch.empty((0, self.dim), device=device)
+        completed_centers_t = torch.stack(completed_centers, dim=0) if len(completed_centers) > 0 else torch.empty((0, self.dim), device=device)
 
         niche_rows: List[Dict] = []
-        for t, row in enumerate(niche_tmp):
+        for row in niche_tmp:
             m = row["members"]
             center = row["center"]
             if self.archive_centers.numel() == 0:
@@ -279,12 +534,21 @@ class NicheManager:
             rescue_count = int(rescue[m].sum().item())
             guardian_count = int(guardian[m].sum().item())
 
+            role = row["status"]
+            if anchor[m].any().item():
+                role = "anchor"
+            elif row.get("is_overlap_redundant", False):
+                role = "overlap_redundant"
+            elif scout[m].any().item():
+                role = "scout"
+
             niche_rows.append(
                 {
-                    "niche_id": int(stable_ids[t]),
-                    "niche_age": int(stable_ages[t]),
+                    "niche_id": int(row["niche_id"]),
+                    "niche_age": int(row["niche_age"]),
                     "size": int(row["size"]),
                     "status": row["status"],
+                    "role": role,
                     "center_norm": row["center_norm"],
                     "radius": row["radius"],
                     "radius_rel": row["radius_rel"],
@@ -292,24 +556,41 @@ class NicheManager:
                     "best_fit": row["best_fit"],
                     "best_improve_rel": row["best_improve_rel"],
                     "accept_ratio_stage": row["accept_ratio_stage"],
+                    "improve_ratio_stage": row["improve_ratio_stage"],
                     "stag_ratio": row["stag_ratio"],
                     "stag_growth": row["stag_growth"],
                     "guardian_count": guardian_count,
                     "release_count": release_count,
                     "rescue_count": rescue_count,
                     "dist_to_archive_min": dist_archive_min,
+                    "overlap_group_id": int(row["overlap_group_id"]),
+                    "is_overlap_redundant": bool(row["is_overlap_redundant"]),
+                    "completion_counter": int(row["completion_counter"]),
+                    "is_anchor": bool(anchor[m].any().item()),
+                    "is_guardian": bool(guardian[m].any().item()),
                 }
             )
+            self.prev_status_by_id[int(row["niche_id"])] = row["status"]
+
+        alive_ids = {int(row["niche_id"]) for row in niche_tmp}
+        stale_status_ids = [k for k in self.prev_status_by_id.keys() if k not in alive_ids]
+        for sid in stale_status_ids:
+            self.prev_status_by_id.pop(sid, None)
 
         return NichePlan(
             exploring_mask=exploring,
             refining_mask=refining,
-            converged_mask=converged,
+            completed_mask=completed,
+            anchor_mask=anchor,
+            scout_mask=scout,
             guardian_mask=guardian,
             release_mask=release,
             rescue_mask=rescue,
             cluster_ids=cluster_ids,
+            overlap_group_ids=overlap_group_ids,
             active_centers=active_centers_t,
+            anchor_centers=anchor_centers_t,
+            completed_centers=completed_centers_t,
             niche_rows=niche_rows,
             n_new_niches=n_new_niches,
             archive_added=archive_added,

@@ -47,7 +47,20 @@ class RLECWrapper(Algorithm):
         self.state_builder = MacroStateBuilder(self.dim, self.pop_size)
         self.reward_calc = StageRewardCalculator()
         self.interpreter = ControlInterpreter(self.pop_size)
-        self.niche_manager = NicheManager(self.pop_size, self.dim, self.device)
+        self.niche_manager = NicheManager(
+            self.pop_size,
+            self.dim,
+            self.device,
+            r_small=0.01,
+            r_shrink=0.40,
+            improve_eps=5e-4,
+            improve_ratio_eps=0.20,
+            complete_patience=2,
+            merge_dist=1.2,
+            merge_fit_eps=1e-2,
+            max_anchor_niches=2,
+            anchor_scale=0.20,
+        )
 
         self.rl_agent = PPO(state_dim=self.state_builder.state_dim, action_dim=6, device=self.device)
 
@@ -84,7 +97,11 @@ class RLECWrapper(Algorithm):
         self.current_cmd_scales = Mutable(torch.ones(self.pop_size, device=self.device))
 
         self.current_niche_guardian = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
-        self.current_niche_converged = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_anchor = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_completed = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_niche_scout = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.current_anchor_budget = Mutable(torch.tensor(0.0, device=self.device))
+        self.current_scout_budget = Mutable(torch.tensor(0.0, device=self.device))
 
         self.current_gate_refine = Mutable(torch.tensor(0.0, device=self.device))
         self.current_gate_recover = Mutable(torch.tensor(0.0, device=self.device))
@@ -97,13 +114,16 @@ class RLECWrapper(Algorithm):
         self.last_rescue_success = Mutable(torch.tensor(0.0, device=self.device))
         self.last_elite_damage = Mutable(torch.tensor(0.0, device=self.device))
 
-        self.niche_summary_vec = Mutable(torch.zeros(8, device=self.device))
-        self.last_niche_reward_stats = Mutable(torch.zeros(5, device=self.device))
+        self.niche_summary_vec = Mutable(torch.zeros(12, device=self.device))
+        self.last_niche_reward_stats = Mutable(torch.zeros(8, device=self.device))
 
         self.last_n_niches = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_exploring = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_refining = Mutable(torch.tensor(0.0, device=self.device))
-        self.last_n_converged = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_completed = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_anchor = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_scout = Mutable(torch.tensor(0.0, device=self.device))
+        self.last_n_overlap_groups = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_guardians = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_release = Mutable(torch.tensor(0.0, device=self.device))
         self.last_n_rescue = Mutable(torch.tensor(0.0, device=self.device))
@@ -115,6 +135,8 @@ class RLECWrapper(Algorithm):
         self.last_release_birth_pop = Mutable(torch.zeros((self.pop_size, self.dim), device=self.device))
         self.stage_guardian_mask = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
         self.stage_guardian_start_best = Mutable(torch.tensor(torch.inf, device=self.device))
+        self.stage_anchor_mask = Mutable(torch.zeros(self.pop_size, dtype=torch.bool, device=self.device))
+        self.stage_anchor_start_best = Mutable(torch.tensor(torch.inf, device=self.device))
 
     @property
     def pop(self):
@@ -176,20 +198,40 @@ class RLECWrapper(Algorithm):
             largest_ratio = max(row["size"] for row in niche_plan.niche_rows) / self.pop_size
             mean_radius_rel = sum(row["radius_rel"] for row in niche_plan.niche_rows) / len(niche_plan.niche_rows)
 
-        n_exploring = len([r for r in niche_plan.niche_rows if r["status"] == "exploring"])
+        n_exploring = len(
+            [r for r in niche_plan.niche_rows if r["status"] == "exploring" and not r.get("is_overlap_redundant", False)]
+        )
         n_refining = len([r for r in niche_plan.niche_rows if r["status"] == "refining"])
-        n_converged = len([r for r in niche_plan.niche_rows if r["status"] == "converged"])
+        n_completed = len([r for r in niche_plan.niche_rows if r["status"] == "completed"])
+        group_count = {}
+        for row in niche_plan.niche_rows:
+            gid = row.get("overlap_group_id", -1)
+            group_count[gid] = group_count.get(gid, 0) + 1
+        overlap_groups = {gid for gid, cnt in group_count.items() if gid >= 0 and cnt > 1}
+        overlap_niches = len([r for r in niche_plan.niche_rows if r.get("is_overlap_redundant", False)])
+        n_anchor = len([r for r in niche_plan.niche_rows if r.get("is_anchor", False)])
+        n_scout = len([r for r in niche_plan.niche_rows if r.get("role", "") == "scout"])
+        n_guardians = int(niche_plan.guardian_mask.sum().item())
+
+        anchor_ratio = float(niche_plan.anchor_mask.float().mean().item())
+        scout_ratio = float(niche_plan.scout_mask.float().mean().item())
+        completed_ratio = (n_completed / n_niches) if n_niches > 0 else 0.0
+        overlap_ratio = (overlap_niches / n_niches) if n_niches > 0 else 0.0
 
         summary = torch.tensor(
             [
                 len(niche_plan.niche_rows) / self.pop_size,
                 largest_ratio,
                 n_refining / n_niches,
-                n_converged / n_niches,
+                n_completed / n_niches,
                 float(self.last_n_release.item()) / self.pop_size,
-                float(self.last_n_guardians.item()) / self.pop_size,
+                n_guardians / self.pop_size,
                 min(1.0, float(self.niche_manager.archive_centers.shape[0]) / self.pop_size),
                 mean_radius_rel,
+                anchor_ratio,
+                scout_ratio,
+                completed_ratio,
+                overlap_ratio,
             ],
             dtype=torch.float32,
             device=self.device,
@@ -198,7 +240,10 @@ class RLECWrapper(Algorithm):
         self.last_n_niches = torch.tensor(float(len(niche_plan.niche_rows)), device=self.device)
         self.last_n_exploring = torch.tensor(float(n_exploring), device=self.device)
         self.last_n_refining = torch.tensor(float(n_refining), device=self.device)
-        self.last_n_converged = torch.tensor(float(n_converged), device=self.device)
+        self.last_n_completed = torch.tensor(float(n_completed), device=self.device)
+        self.last_n_anchor = torch.tensor(float(n_anchor), device=self.device)
+        self.last_n_scout = torch.tensor(float(n_scout), device=self.device)
+        self.last_n_overlap_groups = torch.tensor(float(len(overlap_groups)), device=self.device)
 
         return summary
 
@@ -228,11 +273,21 @@ class RLECWrapper(Algorithm):
             "n_niches": int(self.last_n_niches.item()),
             "n_exploring": int(self.last_n_exploring.item()),
             "n_refining": int(self.last_n_refining.item()),
-            "n_converged": int(self.last_n_converged.item()),
+            "n_completed": int(self.last_n_completed.item()),
+            "n_anchor": int(self.last_n_anchor.item()),
+            "n_scout": int(self.last_n_scout.item()),
+            "n_overlap_groups": int(self.last_n_overlap_groups.item()),
             "n_guardians": int(self.last_n_guardians.item()),
             "n_release": int(self.last_n_release.item()),
             "n_rescue": int(self.last_n_rescue.item()),
             "archive_size": int(self.niche_manager.archive_centers.shape[0]),
+            "anchor_ratio": float(self.niche_summary_vec[8].item()),
+            "scout_ratio": float(self.niche_summary_vec[9].item()),
+            "completed_ratio": float(self.niche_summary_vec[10].item()),
+            "overlap_ratio": float(self.niche_summary_vec[11].item()),
+            "scout_birth_efficiency": float(self.last_niche_reward_stats[6].item()),
+            "anchor_stability": float(self.last_niche_reward_stats[5].item()),
+            "overlap_penalty": float(self.last_niche_reward_stats[7].item()),
             "intervene_ratio": float(self.last_intervene_ratio.item()),
             "accept_ratio": float(self.last_accept_ratio.item()),
             "rescue_success": float(self.last_rescue_success.item()),
@@ -251,6 +306,7 @@ class RLECWrapper(Algorithm):
                 "niche_age": row["niche_age"],
                 "size": row["size"],
                 "status": row["status"],
+                "role": row.get("role", row["status"]),
                 "center_norm": row["center_norm"],
                 "radius": row["radius"],
                 "radius_rel": row["radius_rel"],
@@ -265,6 +321,11 @@ class RLECWrapper(Algorithm):
                 "release_count": row["release_count"],
                 "rescue_count": row["rescue_count"],
                 "dist_to_archive_min": row["dist_to_archive_min"],
+                "overlap_group_id": row.get("overlap_group_id", -1),
+                "is_overlap_redundant": row.get("is_overlap_redundant", False),
+                "completion_counter": row.get("completion_counter", 0),
+                "is_anchor": row.get("is_anchor", False),
+                "is_guardian": row.get("is_guardian", False),
             }
             niche_rows.append(out)
         self.niche_logger.log_niches(niche_rows)
@@ -335,22 +396,11 @@ class RLECWrapper(Algorithm):
         self.current_gate_refine = g_refine.detach()
         self.current_gate_recover = g_recover.detach()
 
-        cmd = self.interpreter.interpret(intent_eff_obj, current_fit, self.stagnation, float(self.initial_div.item()))
-
         self.last_action_raw = torch.tensor(action_raw, device=self.device, dtype=torch.float32)
         self.last_intent = intent_tensor.clone()
         self.last_intent_eff = intent_eff_tensor.clone()
         self.last_logprob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
         self.last_value = torch.tensor(value, device=self.device, dtype=torch.float32)
-
-        self.current_cmd_protected = cmd.protected_mask.clone()
-        self.current_cmd_middle = cmd.middle_mask.clone()
-        self.current_cmd_quiet = cmd.quiet_mask.clone()
-        self.current_cmd_rescue = cmd.rescue_mask.clone()
-        self.current_cmd_scales = cmd.step_scales.clone()
-        self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
-        self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
-        self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
 
         niche_plan = self.niche_manager.plan(
             pop=current_pop,
@@ -363,11 +413,49 @@ class RLECWrapper(Algorithm):
             initial_div=float(self.initial_div.item()),
         )
 
-        self.current_niche_guardian = niche_plan.guardian_mask.clone()
-        self.current_niche_converged = niche_plan.converged_mask.clone()
+        cmd = self.interpreter.interpret(
+            intent_eff_obj,
+            current_fit,
+            self.stagnation,
+            float(self.initial_div.item()),
+            niche_roles={
+                "anchor_mask": niche_plan.anchor_mask,
+                "scout_mask": niche_plan.scout_mask,
+                "completed_mask": niche_plan.completed_mask,
+                "guardian_mask": niche_plan.guardian_mask,
+            },
+        )
 
-        self.current_cmd_protected = self.current_cmd_protected | niche_plan.guardian_mask
-        self.current_cmd_quiet = self.current_cmd_quiet | niche_plan.guardian_mask
+        self.current_cmd_protected = cmd.protected_mask.clone()
+        self.current_cmd_middle = cmd.middle_mask.clone()
+        self.current_cmd_quiet = cmd.quiet_mask.clone()
+        self.current_cmd_rescue = cmd.rescue_mask.clone()
+        self.current_cmd_scales = cmd.step_scales.clone()
+        self.current_cmd_alpha_margin = torch.tensor(cmd.alpha_margin, device=self.device)
+        self.current_cmd_beta_margin = torch.tensor(cmd.beta_margin, device=self.device)
+        self.current_cmd_target_div = torch.tensor(cmd.target_diversity, device=self.device)
+
+        self.current_niche_guardian = niche_plan.guardian_mask.clone()
+        self.current_niche_anchor = niche_plan.anchor_mask.clone()
+        self.current_niche_completed = niche_plan.completed_mask.clone()
+        self.current_niche_scout = niche_plan.scout_mask.clone()
+
+        self.current_anchor_budget = torch.tensor(
+            float(niche_plan.anchor_mask.sum().item()) / max(1.0, float(self.pop_size)),
+            device=self.device,
+        )
+        self.current_scout_budget = torch.tensor(
+            float(niche_plan.scout_mask.sum().item()) / max(1.0, float(self.pop_size)),
+            device=self.device,
+        )
+
+        anchor_mask = niche_plan.anchor_mask
+        anchor_guardian = niche_plan.guardian_mask & anchor_mask
+        completed_non_guardian = niche_plan.completed_mask & (~niche_plan.guardian_mask)
+
+        self.current_cmd_protected = self.current_cmd_protected | anchor_guardian
+        self.current_cmd_quiet = self.current_cmd_quiet & (~anchor_mask)
+        self.current_cmd_quiet[anchor_guardian] = True
 
         role_active = niche_plan.exploring_mask | niche_plan.refining_mask
         self.current_cmd_middle = self.current_cmd_middle & role_active & (~niche_plan.guardian_mask)
@@ -375,16 +463,18 @@ class RLECWrapper(Algorithm):
             self.current_cmd_rescue
             & niche_plan.rescue_mask
             & niche_plan.exploring_mask
+            & (~anchor_mask)
             & (~niche_plan.guardian_mask)
         )
 
         self.current_cmd_scales[niche_plan.refining_mask] = self.current_cmd_scales[niche_plan.refining_mask] * 0.55
-
-        converged_non_guardian = niche_plan.converged_mask & (~niche_plan.guardian_mask)
-        self.current_cmd_middle[converged_non_guardian] = False
-        self.current_cmd_rescue[converged_non_guardian] = False
-        self.current_cmd_scales[converged_non_guardian] = 0.0
-        self.current_cmd_quiet[converged_non_guardian] = False
+        self.current_cmd_scales[anchor_mask] = self.current_cmd_scales[anchor_mask] * self.niche_manager.anchor_scale
+        self.current_cmd_middle[anchor_guardian] = False
+        self.current_cmd_rescue[anchor_mask] = False
+        self.current_cmd_middle[completed_non_guardian] = False
+        self.current_cmd_rescue[completed_non_guardian] = False
+        self.current_cmd_protected[niche_plan.scout_mask] = False
+        self.current_cmd_quiet[niche_plan.scout_mask] = False
 
         self.current_cmd_alpha_margin = self.current_cmd_alpha_margin * (1.0 - 0.4 * g_refine)
         self.current_cmd_beta_margin = self.current_cmd_beta_margin * (1.0 - 0.4 * g_refine)
@@ -394,11 +484,17 @@ class RLECWrapper(Algorithm):
         self.last_release_baseline_fit = torch.zeros(self.pop_size, device=self.device)
 
         if release_idx.numel() > 0:
+            if niche_plan.active_centers.numel() > 0 and niche_plan.anchor_centers.numel() > 0:
+                avoid_centers = torch.cat([niche_plan.active_centers, niche_plan.anchor_centers], dim=0)
+            elif niche_plan.anchor_centers.numel() > 0:
+                avoid_centers = niche_plan.anchor_centers
+            else:
+                avoid_centers = niche_plan.active_centers
             new_pos = self.niche_manager.sample_release_positions(
                 int(release_idx.numel()),
                 self.lb,
                 self.ub,
-                avoid_centers=niche_plan.active_centers,
+                avoid_centers=avoid_centers,
             )
             self.base.pop[release_idx] = new_pos
             self.base.fit[release_idx] = self.evaluate(new_pos)
@@ -407,8 +503,10 @@ class RLECWrapper(Algorithm):
             self.prev_pop[release_idx] = self.base.pop[release_idx]
             self.prev_fit[release_idx] = self.base.fit[release_idx]
 
-            self.current_niche_converged[release_idx] = False
+            self.current_niche_completed[release_idx] = False
             self.current_niche_guardian[release_idx] = False
+            self.current_niche_anchor[release_idx] = False
+            self.current_niche_scout[release_idx] = True
             self.current_cmd_quiet[release_idx] = False
             self.current_cmd_protected[release_idx] = False
             self.current_cmd_rescue[release_idx] = False
@@ -445,6 +543,9 @@ class RLECWrapper(Algorithm):
                 stage_repeat_ratio,
                 0.0,
                 0.0,
+                0.0,
+                0.0,
+                float(self.niche_summary_vec[11].item()),
             ],
             device=self.device,
             dtype=torch.float32,
@@ -454,11 +555,16 @@ class RLECWrapper(Algorithm):
         self.stage_start_fit = self.base.fit.clone()
         self.stage_start_div = current_div
         self.stage_start_stagnation = self.stagnation.clone()
-        self.stage_guardian_mask = self.current_niche_guardian.clone()
+        self.stage_guardian_mask = (self.current_niche_guardian & self.current_niche_anchor).clone()
         if self.stage_guardian_mask.any():
             self.stage_guardian_start_best = torch.min(self.base.fit[self.stage_guardian_mask]).clone()
         else:
             self.stage_guardian_start_best = torch.tensor(torch.inf, device=self.device)
+        self.stage_anchor_mask = self.current_niche_anchor.clone()
+        if self.stage_anchor_mask.any():
+            self.stage_anchor_start_best = torch.min(self.base.fit[self.stage_anchor_mask]).clone()
+        else:
+            self.stage_anchor_start_best = torch.tensor(torch.inf, device=self.device)
 
         self._log_stage_and_niches(current_div, niche_plan, self.last_intent_eff)
         self.stage_counter = self.stage_counter + 1
@@ -520,9 +626,27 @@ class RLECWrapper(Algorithm):
             else:
                 guardian_stability = 0.0
 
+            anchor_mask = self.stage_anchor_mask
+            if anchor_mask.any():
+                curr_anchor_best = torch.min(self.base.fit[anchor_mask])
+                start_anchor_best = self.stage_anchor_start_best
+                anchor_improve = (start_anchor_best - curr_anchor_best) / (torch.abs(start_anchor_best) + 1e-8)
+                anchor_stability = float(torch.clamp(0.5 + 0.5 * anchor_improve, 0.0, 1.0).item())
+            else:
+                anchor_stability = 0.0
+
+            scout_birth_efficiency = 0.0
+            if release_count > 0:
+                scout_birth_efficiency = float(min(1.0, release_efficiency * (1.0 + self.last_niche_reward_stats[0].item())))
+
+            overlap_penalty = float(torch.clamp(self.niche_summary_vec[11], 0.0, 1.0).item())
+
             niche_stats = self.last_niche_reward_stats.clone()
             niche_stats[3] = guardian_stability
             niche_stats[4] = release_efficiency
+            niche_stats[5] = anchor_stability
+            niche_stats[6] = scout_birth_efficiency
+            niche_stats[7] = overlap_penalty
 
             reward = self.reward_calc.calculate(
                 fit_start=old_stage_start_fit,
@@ -558,7 +682,7 @@ class RLECWrapper(Algorithm):
         curr_pop = self.base.pop.clone()
         curr_fit = self.base.fit.clone()
 
-        guardian_mask = self.current_niche_guardian
+        guardian_mask = self.current_niche_guardian & self.current_niche_anchor
         if guardian_mask.any():
             curr_pop[guardian_mask] = self.prev_pop[guardian_mask]
             curr_fit[guardian_mask] = self.prev_fit[guardian_mask]

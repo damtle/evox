@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 
 
 class StageRewardCalculator:
@@ -50,15 +50,43 @@ class StageRewardCalculator:
         compact_basin = (div_end / (initial_div + 1e-8)) < 0.12
         r_late_settle = (-0.2 * e_t - 0.15 * b_t) if compact_basin else 0.0
 
-        # Niche-aware credit terms.
-        # niche_stats = [new_niche_norm, archive_unique_norm, repeat_ratio, guardian_stability, release_efficiency]
-        new_niche_norm, archive_unique_norm, repeat_ratio, guardian_stability, release_efficiency = niche_stats.tolist()
+        # niche_stats = [
+        #   new_niche_norm, archive_unique_norm, repeat_ratio,
+        #   guardian_stability, release_efficiency,
+        #   anchor_stability, scout_birth_efficiency, overlap_penalty
+        # ]
+        (
+            new_niche_norm,
+            archive_unique_norm,
+            repeat_ratio,
+            guardian_stability,
+            release_efficiency,
+            anchor_stability,
+            scout_birth_efficiency,
+            overlap_penalty,
+        ) = niche_stats.tolist()
+
         r_new_niche = 0.20 * new_niche_norm
         r_archive_unique = 0.20 * archive_unique_norm
         r_repeat_penalty = -0.25 * repeat_ratio
         r_guardian_stability = 0.20 * guardian_stability
         r_release_eff = 0.20 * release_efficiency
-        r_niche = r_new_niche + r_archive_unique + r_repeat_penalty + r_guardian_stability + r_release_eff
+
+        # Incremental new terms with small weights.
+        r_anchor_stability = 0.12 * anchor_stability
+        r_scout_birth = 0.12 * scout_birth_efficiency
+        r_overlap_penalty = -0.10 * overlap_penalty
+
+        r_niche = (
+            r_new_niche
+            + r_archive_unique
+            + r_repeat_penalty
+            + r_guardian_stability
+            + r_release_eff
+            + r_anchor_stability
+            + r_scout_birth
+            + r_overlap_penalty
+        )
 
         r_ctrl = (
             r_efficiency
